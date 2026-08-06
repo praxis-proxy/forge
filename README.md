@@ -3,6 +3,20 @@
 Declarative development-environment orchestrator for KIND clusters, container
 services, and deployment stacks.
 
+## Summary
+
+Forge is a standalone, project-neutral CLI for creating and managing
+reproducible local Kubernetes environments. It provisions KIND clusters,
+Docker or Podman networks, host services, and declarative deployment stacks
+using a versioned `forge.yaml` configuration.
+
+Forge is extracted from Grid but does not depend on Grid or deploy Grid
+runtime components. Grid, demos, and MaaS/IPP define their own Forge
+configurations and remain responsible for topology-specific assertions and
+runtime behavior. The supported CLI, configuration schema, cleanup ownership,
+evidence paths, and non-interactive workflows remain compatible with the
+in-tree implementation.
+
 Forge reads a single `forge.yaml` file and brings up reproducible local
 environments: Docker/Podman networks, KIND clusters, host-level container
 services, and multi-step deployment stacks (kubectl, Helm, kustomize,
