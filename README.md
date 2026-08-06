@@ -218,4 +218,4 @@ external command execution without running real processes.
 
 ## License
 
-MIT
+Apache License 2.0
