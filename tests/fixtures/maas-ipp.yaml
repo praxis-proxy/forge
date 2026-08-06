@@ -1,0 +1,86 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: maas-ipp
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: maas-ipp
+
+  network:
+    crossCluster: false
+    dnsZone: maas-ipp.test
+
+  clusters:
+    - name: local
+      stacks:
+        - metallb
+        - gateway-api
+        - platform
+        - fixtures
+      properties:
+        metallbVersion: "v0.14.9"
+        metallbSha256: "951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4"
+        gatewayApiVersion: "1.5.1"
+        gatewayApiSha256: "751002b3b91a87f7ae3bd2517c79a47a8d7ed6702901808a1cf9bd97d284f9b8"
+        gieVersion: "v1.5.0"
+        maasNamespace: maas-system
+        gatewayNamespace: istio-system
+
+  stacks:
+    metallb:
+      description: MetalLB load balancer with Kind docker-network IP pool
+      steps:
+        - type: url
+          url: https://raw.githubusercontent.com/metallb/metallb/{{ cluster.properties.metallbVersion }}/config/manifests/metallb-native.yaml
+          sha256: "{{ cluster.properties.metallbSha256 }}"
+        - type: wait
+          resource: deployment/controller
+          namespace: metallb-system
+          condition: available
+          timeout: "180s"
+        - type: exec
+          command:
+            - bash
+            - scripts/install-metallb-pool.sh
+            - kind-maas-ipp-{{ cluster.name }}
+
+    gateway-api:
+      description: Gateway API CRDs + Inference Extension CRDs
+      steps:
+        - type: url
+          url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ cluster.properties.gatewayApiVersion }}/standard-install.yaml
+          sha256: "{{ cluster.properties.gatewayApiSha256 }}"
+        - type: exec
+          env:
+            GIE_VERSION: "{{ cluster.properties.gieVersion }}"
+          command:
+            - bash
+            - scripts/install-gie-crds.sh
+            - kind-maas-ipp-{{ cluster.name }}
+
+    platform:
+      description: Platform components
+      steps:
+        - type: exec
+          env:
+            MAAS_NAMESPACE: "{{ cluster.properties.maasNamespace }}"
+            GATEWAY_NAMESPACE: "{{ cluster.properties.gatewayNamespace }}"
+          command:
+            - bash
+            - scripts/install-platform.sh
+            - kind-maas-ipp-{{ cluster.name }}
+
+    fixtures:
+      description: Test fixtures
+      steps:
+        - type: exec
+          env:
+            MAAS_NAMESPACE: "{{ cluster.properties.maasNamespace }}"
+            GATEWAY_NAMESPACE: "{{ cluster.properties.gatewayNamespace }}"
+          command:
+            - bash
+            - scripts/install-fixtures.sh
+            - kind-maas-ipp-{{ cluster.name }}

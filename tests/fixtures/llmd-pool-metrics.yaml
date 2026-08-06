@@ -1,0 +1,134 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: llmd-pool-metrics
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: llmd-pm
+
+  network:
+    crossCluster: true
+    dnsZone: llmd-pm.test
+
+  clusters:
+    - name: pool-a
+      stacks: [metallb, operator, pool, site, gateway]
+      properties:
+        region: pool-a
+        role: combined
+        siteName: pool-a
+        poolName: pool-a
+
+    - name: pool-b
+      stacks: [metallb, operator, pool, site, gateway]
+      properties:
+        region: pool-b
+        role: combined
+        siteName: pool-b
+        poolName: pool-b
+
+  stacks:
+    metallb:
+      description: MetalLB load balancer with auto-configured address pool
+      steps:
+        - type: url
+          url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+          sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
+        - type: wait
+          resource: deployment/controller
+          namespace: metallb-system
+          condition: available
+          timeout: "120s"
+        - type: metallb-auto-pool
+          name: forge-pool
+
+    operator:
+      description: Operator with SWIM
+      steps:
+        - type: helm
+          release: operator
+          chart: charts/operator
+          version: "0.1.0"
+          namespace: app-system
+          values:
+            swim:
+              siteName: "{{ cluster.properties.siteName }}"
+              seeds: ""
+              service:
+                enabled: true
+                type: LoadBalancer
+        - type: wait
+          resource: deployment/operator
+          namespace: app-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/operator-swim
+          namespace: app-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: swim-lb-ip
+          timeout: "60s"
+          interval: "2s"
+
+    pool:
+      description: Inference pool simulators
+      steps:
+        - type: manifest
+          path: resources/common/namespace.yaml
+        - type: manifest
+          path: resources/{{ cluster.properties.poolName }}/sim-deployment.yaml
+        - type: wait
+          resource: deployment/sim-1
+          namespace: app-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/epp-metrics
+          namespace: app-system
+          jsonpath: "{.spec.clusterIP}"
+          key: epp-metrics-ip
+          timeout: "30s"
+          interval: "2s"
+
+    site:
+      description: Site CRs with pool name
+      steps:
+        - type: helm
+          release: site
+          chart: charts/site
+          version: "0.1.0"
+          namespace: app-system
+          values:
+            siteName: "{{ cluster.properties.siteName }}"
+            poolName: "{{ cluster.properties.poolName }}"
+
+    gateway:
+      description: Provider and consumer gateways
+      steps:
+        - type: template-file
+          source: configs/provider/config.yaml
+          target: .forge/runtime/{{ cluster.name }}/provider/config.yaml
+        - type: helm
+          release: provider-gateway
+          chart: charts/gateway
+          version: "0.1.0"
+          namespace: app-system
+          values:
+            service:
+              type: LoadBalancer
+              port: 8443
+        - type: wait
+          resource: deployment/provider-gateway
+          namespace: app-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/provider-gateway
+          namespace: app-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: provider-gateway-ip
+          timeout: "60s"
+          interval: "2s"

@@ -1,0 +1,14 @@
+too-many-lines-threshold = 50
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 5
+max-fn-params-bools = 2
+max-struct-bools = 2
+enum-variant-size-threshold = 128
+future-size-threshold = 4096
+type-complexity-threshold = 200
+stack-size-threshold = 20480
+avoid-breaking-exported-api = false
+disallowed-methods = [
+    { path = "std::io::stdin", reason = "forge must not read interactive input in automated mode" },
+    { path = "std::io::Stdin::read_line", reason = "forge must not read interactive input in automated mode" },
+]

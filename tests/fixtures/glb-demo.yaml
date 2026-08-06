@@ -1,0 +1,90 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: glb-demo
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: glb
+
+  network:
+    crossCluster: true
+    dnsZone: glb.test
+
+  clusters:
+    - name: east-provider
+      stacks: [metallb, operator, site]
+      properties:
+        region: east
+        role: provider
+        imagePullPolicy: Never
+
+    - name: west-provider
+      stacks: [metallb, operator, site]
+      properties:
+        region: west
+        role: provider
+        imagePullPolicy: Never
+
+    - name: east-edge
+      stacks: [metallb, operator, site]
+      properties:
+        region: east
+        role: edge
+        imagePullPolicy: Never
+
+    - name: west-edge
+      stacks: [metallb, operator, site]
+      properties:
+        region: west
+        role: edge
+        imagePullPolicy: Never
+
+  stacks:
+    metallb:
+      description: MetalLB load balancer with auto-configured address pool
+      steps:
+        - type: url
+          url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+          sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
+        - type: wait
+          resource: deployment/controller
+          namespace: metallb-system
+          condition: available
+          timeout: "120s"
+        - type: metallb-auto-pool
+          name: forge-pool
+
+    operator:
+      description: Operator deployment with SWIM and capture
+      steps:
+        - type: helm
+          release: operator
+          chart: charts/operator
+          version: "0.1.0"
+          namespace: app-system
+          values:
+            swim:
+              service:
+                enabled: true
+                type: LoadBalancer
+        - type: wait
+          resource: deployment/operator
+          namespace: app-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/operator-swim
+          namespace: app-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: swim-lb-ip
+          timeout: "60s"
+          interval: "2s"
+
+    site:
+      description: Site manifests with template rendering
+      steps:
+        - type: template-manifest
+          path: resources/site-{{ cluster.name }}.yaml
