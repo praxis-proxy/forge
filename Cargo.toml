@@ -1,3 +1,6 @@
+[workspace]
+members = ["xtask"]
+
 [package]
 name = "forge"
 version = "0.1.1"
@@ -9,6 +12,9 @@ description = "Declarative development-environment orchestrator for KIND cluster
 [[bin]]
 name = "praxis-forge"
 path = "src/main.rs"
+
+[lints]
+workspace = true
 
 [features]
 test-support = []
@@ -42,7 +48,7 @@ lto = false
 [profile.dev.package."*"]
 opt-level = 2
 
-[lints.rust]
+[workspace.lints.rust]
 dead_code = "deny"
 unsafe_code = "deny"
 missing_docs = "deny"
@@ -65,7 +71,7 @@ noop_method_call = "deny"
 redundant_lifetimes = "deny"
 missing_debug_implementations = "allow"
 
-[lints.clippy]
+[workspace.lints.clippy]
 await_holding_lock = "deny"
 await_holding_refcell_ref = "deny"
 future_not_send = "deny"
@@ -208,7 +214,7 @@ lossy_float_literal = "deny"
 semicolon_inside_block = "deny"
 disallowed_methods = "deny"
 
-[lints.rustdoc]
+[workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
 invalid_codeblock_attributes = "deny"
