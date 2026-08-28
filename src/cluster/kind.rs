@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     command::runner::{CommandOutput, CommandRunner, CommandSpec},
-    config::NodeConfig,
+    config::{NodeConfig, PortMapping},
     error::ForgeError,
 };
 
@@ -40,6 +40,18 @@ pub fn cluster_exists(runner: &dyn CommandRunner, kind_name: &str) -> Result<boo
     Ok(clusters.iter().any(|cl| cl == kind_name))
 }
 
+/// Configuration for creating a KIND cluster.
+pub struct CreateClusterConfig<'cfg> {
+    /// Node layout for the cluster.
+    pub nodes: &'cfg NodeConfig,
+    /// Port mappings to add to the first control-plane node.
+    pub ports: &'cfg [PortMapping],
+    /// Directory where config files are written.
+    pub config_dir: &'cfg std::path::Path,
+    /// Optional Docker network to join via `KIND_EXPERIMENTAL_DOCKER_NETWORK`.
+    pub docker_network: Option<&'cfg str>,
+}
+
 /// Create a KIND cluster with a generated config.
 ///
 /// When `docker_network` is `Some`, the cluster nodes join that
@@ -51,13 +63,11 @@ pub fn cluster_exists(runner: &dyn CommandRunner, kind_name: &str) -> Result<boo
 pub fn create_cluster(
     runner: &dyn CommandRunner,
     kind_name: &str,
-    nodes: &NodeConfig,
-    config_dir: &std::path::Path,
-    docker_network: Option<&str>,
+    config: &CreateClusterConfig<'_>,
 ) -> Result<(), ForgeError> {
-    let config_yaml = generate_kind_config(nodes);
-    let config_path = write_kind_config(config_dir, kind_name, &config_yaml)?;
-    let result = run_create(runner, kind_name, &config_path, docker_network);
+    let config_yaml = generate_kind_config(config.nodes, config.ports);
+    let config_path = write_kind_config(config.config_dir, kind_name, &config_yaml)?;
+    let result = run_create(runner, kind_name, &config_path, config.docker_network);
     cleanup_kind_config(&config_path);
     result
 }
@@ -126,15 +136,40 @@ pub fn run_kubectl(runner: &dyn CommandRunner, kind_name: &str, args: &[String])
 // ---------------------------------------------------------------
 
 /// Generate a KIND cluster config YAML from a [`NodeConfig`].
-pub fn generate_kind_config(nodes: &NodeConfig) -> String {
+///
+/// When `ports` is non-empty, `extraPortMappings` entries are added
+/// to the first control-plane node (KIND only supports port mappings
+/// on control-plane nodes).
+pub fn generate_kind_config(nodes: &NodeConfig, ports: &[PortMapping]) -> String {
     let mut yaml = String::from("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n");
-    for _ in 0..nodes.control_planes {
+    for idx in 0..nodes.control_planes {
         yaml.push_str("  - role: control-plane\n");
+        if idx == 0 && !ports.is_empty() {
+            write_port_mappings(&mut yaml, ports);
+        }
     }
     for _ in 0..nodes.workers {
         yaml.push_str("  - role: worker\n");
     }
     yaml
+}
+
+/// Append `extraPortMappings` entries for a control-plane node.
+fn write_port_mappings(yaml: &mut String, ports: &[PortMapping]) {
+    use std::fmt::Write as _;
+    yaml.push_str("    extraPortMappings:\n");
+    for port in ports {
+        let _written = write!(
+            yaml,
+            "      - hostPort: {}\n        containerPort: {}\n        protocol: {}\n",
+            port.host,
+            port.container,
+            port.protocol.to_uppercase(),
+        );
+        if let Some(addr) = &port.bind_address {
+            let _addr_written = writeln!(yaml, "        listenAddress: \"{addr}\"");
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -292,7 +327,7 @@ mod tests {
     #[test]
     fn generate_kind_config_default_nodes() {
         let nodes = NodeConfig::default();
-        let yaml = generate_kind_config(&nodes);
+        let yaml = generate_kind_config(&nodes, &[]);
         assert!(yaml.contains("control-plane"), "should have control-plane");
         let cp_count = yaml.matches("control-plane").count();
         assert_eq!(cp_count, 1, "default should have 1 control-plane, got {cp_count}");
@@ -305,11 +340,60 @@ mod tests {
             control_planes: 3,
             workers: 2,
         };
-        let yaml = generate_kind_config(&nodes);
+        let yaml = generate_kind_config(&nodes, &[]);
         let cp_count = yaml.matches("control-plane").count();
         let w_count = yaml.matches("worker").count();
         assert_eq!(cp_count, 3, "should have 3 control-planes, got {cp_count}");
         assert_eq!(w_count, 2, "should have 2 workers, got {w_count}");
+    }
+
+    #[test]
+    fn generate_kind_config_with_port_mappings() {
+        let nodes = NodeConfig::default();
+        let ports = vec![
+            PortMapping {
+                bind_address: None,
+                host: 13000,
+                container: 30300,
+                protocol: "tcp".to_owned(),
+            },
+            PortMapping {
+                bind_address: Some("127.0.0.1".to_owned()),
+                host: 19090,
+                container: 30909,
+                protocol: "udp".to_owned(),
+            },
+        ];
+        let yaml = generate_kind_config(&nodes, &ports);
+        assert!(yaml.contains("extraPortMappings:"), "should have extraPortMappings");
+        assert!(yaml.contains("hostPort: 13000"), "should map first host port");
+        assert!(yaml.contains("containerPort: 30300"), "should map first container port");
+        assert!(yaml.contains("hostPort: 19090"), "should map second host port");
+        assert!(yaml.contains("protocol: UDP"), "should uppercase protocol");
+        assert!(
+            yaml.contains("listenAddress: \"127.0.0.1\""),
+            "should include listen address"
+        );
+    }
+
+    #[test]
+    fn generate_kind_config_port_mappings_only_on_first_control_plane() {
+        let nodes = NodeConfig {
+            control_planes: 2,
+            workers: 0,
+        };
+        let ports = vec![PortMapping {
+            bind_address: None,
+            host: 8080,
+            container: 30080,
+            protocol: "tcp".to_owned(),
+        }];
+        let yaml = generate_kind_config(&nodes, &ports);
+        assert_eq!(
+            yaml.matches("extraPortMappings:").count(),
+            1,
+            "port mappings should only appear on the first control-plane node"
+        );
     }
 
     #[test]

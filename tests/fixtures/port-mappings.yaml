@@ -1,0 +1,30 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: port-mapping-test
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: pm-test
+
+  network:
+    crossCluster: false
+    dnsZone: pm.test
+
+  clusters:
+    - name: local
+      ports:
+        - host: 8080
+          container: 30080
+        - host: 3000
+          container: 30300
+          protocol: tcp
+        - host: 9090
+          container: 30090
+          bindAddress: "127.0.0.1"
+          protocol: udp
+      stacks: []
+
+  stacks: {}
