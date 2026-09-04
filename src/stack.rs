@@ -751,6 +751,7 @@ mod tests {
                 clusters: vec![ClusterSpec {
                     name: "hub".to_owned(),
                     nodes: NodeConfig::default(),
+                    ports: Vec::new(),
                     stacks: vec!["base".to_owned()],
                     properties: BTreeMap::new(),
                 }],

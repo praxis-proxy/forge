@@ -295,3 +295,29 @@ fn cli_accepts_stack_status() {
     let result = Cli::try_parse_from(["praxis-forge", "stack", "status"]);
     assert!(result.is_ok(), "stack status should parse: {result:?}");
 }
+
+// ---------------------------------------------------------------
+// Cluster port mappings
+// ---------------------------------------------------------------
+
+#[test]
+fn config_with_port_mappings_parses_and_validates() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/port-mappings.yaml");
+    let cfg = config::load(&path).unwrap_or_else(|_| std::process::abort());
+    validate::validate(&cfg).unwrap_or_else(|_| std::process::abort());
+    let cluster = cfg.spec.clusters.first().unwrap_or_else(|| std::process::abort());
+    assert_eq!(cluster.ports.len(), 3, "should have 3 port mappings");
+    assert_port_mapping(cluster.ports.first(), (8080, 30080, None, "tcp"));
+    assert_port_mapping(cluster.ports.get(2), (9090, 30090, Some("127.0.0.1"), "udp"));
+}
+
+/// Assert a single port mapping's fields against `(host, container,
+/// bind_address, protocol)`.
+fn assert_port_mapping(port: Option<&config::PortMapping>, expected: (u16, u16, Option<&str>, &str)) {
+    let port = port.unwrap_or_else(|| std::process::abort());
+    let (host, container, bind_address, protocol) = expected;
+    assert_eq!(port.host, host, "host port mismatch");
+    assert_eq!(port.container, container, "container port mismatch");
+    assert_eq!(port.bind_address.as_deref(), bind_address, "bind address mismatch");
+    assert_eq!(port.protocol, protocol, "protocol mismatch");
+}
