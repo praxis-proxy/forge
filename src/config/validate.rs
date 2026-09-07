@@ -224,15 +224,7 @@ fn check_cluster_port(pm: &PortMapping, cluster_name: &str) -> Result<(), ForgeE
             "cluster {cluster_name:?}: port mapping host and container ports must not be zero"
         )));
     }
-    if let Some(addr) = pm
-        .bind_address
-        .as_ref()
-        .filter(|bind| bind.parse::<std::net::IpAddr>().is_err())
-    {
-        return Err(ForgeError::Validation(format!(
-            "cluster {cluster_name:?}: bind address {addr:?} is not a valid IP"
-        )));
-    }
+    check_bind_address(pm.bind_address.as_ref(), PortOwner::Cluster(cluster_name))?;
     check_cluster_port_protocol(&pm.protocol, cluster_name)
 }
 
@@ -285,7 +277,7 @@ fn check_service_ports(svc: &ServiceSpec) -> Result<(), ForgeError> {
     for port in &svc.ports {
         check_port_nonzero(port.host, &svc.name, "host")?;
         check_port_nonzero(port.container, &svc.name, "container")?;
-        check_port_bind_address(port.bind_address.as_ref(), &svc.name)?;
+        check_bind_address(port.bind_address.as_ref(), PortOwner::Service(&svc.name))?;
         check_port_protocol_tcp(&port.protocol, &svc.name)?;
     }
     Ok(())
@@ -301,11 +293,11 @@ fn check_port_nonzero(port: u16, svc_name: &str, field: &str) -> Result<(), Forg
     Ok(())
 }
 
-/// Validate an optional bind address as a valid IP.
-fn check_port_bind_address(addr: Option<&String>, svc_name: &str) -> Result<(), ForgeError> {
+/// Validate an optional bind address as a valid IP, for either kind of owner.
+fn check_bind_address(addr: Option<&String>, owner: PortOwner<'_>) -> Result<(), ForgeError> {
     if let Some(addr) = addr.filter(|bind| bind.parse::<std::net::IpAddr>().is_err()) {
         return Err(ForgeError::Validation(format!(
-            "service {svc_name:?}: bind address {addr:?} is not a valid IP"
+            "{owner}: bind address {addr:?} is not a valid IP"
         )));
     }
     Ok(())
@@ -327,6 +319,11 @@ fn check_cluster_port_protocol(protocol: &str, cluster_name: &str) -> Result<(),
 }
 
 /// F3 only allows TCP port protocol.
+///
+/// Deliberately stricter than [`check_cluster_port_protocol`], which accepts
+/// TCP, UDP and SCTP case-insensitively: cluster mappings are handed to KIND,
+/// which supports all three, while service ports are published by the runtime
+/// wrapper here, which only implements TCP.
 fn check_port_protocol_tcp(protocol: &str, svc_name: &str) -> Result<(), ForgeError> {
     if protocol != "tcp" {
         return Err(ForgeError::Validation(format!(
@@ -642,8 +639,20 @@ enum BindAddr {
 /// has already rejected them with a dedicated error by this point.
 fn parse_bind_addr(addr: Option<&str>) -> BindAddr {
     match addr.and_then(|val| val.parse::<std::net::IpAddr>().ok()) {
-        Some(ip) if !ip.is_unspecified() => BindAddr::Specific(ip),
+        Some(ip) if !ip.is_unspecified() => BindAddr::Specific(canonical_ip(ip)),
         _ => BindAddr::Wildcard,
+    }
+}
+
+/// Collapse an IPv4-mapped IPv6 address to its IPv4 form.
+///
+/// `::ffff:127.0.0.1` and `127.0.0.1` name the same interface to the container
+/// runtime, but `IpAddr` compares them by variant and would call them distinct
+/// bindings -- so the pair would pass validation and collide at `forge up`.
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        std::net::IpAddr::V4(_) => ip,
     }
 }
 
@@ -1875,6 +1884,48 @@ mod tests {
             .spec
             .services
             .push(test_service_with_port(cluster_port(8080, "tcp", Some("127.0.0.2"))));
+        validate(&config).unwrap_or_else(|_e| {
+            std::process::abort();
+        });
+    }
+
+    /// `::ffff:127.0.0.1` and `127.0.0.1` are the same interface to the
+    /// container runtime, so they must collide rather than pass as two
+    /// distinct bindings.
+    #[test]
+    fn ipv4_mapped_ipv6_conflicts_with_its_ipv4_form() {
+        let mut config = base_config();
+        config.spec.clusters.push(test_cluster_with_ports(
+            "alpha",
+            vec![cluster_port(8080, "tcp", Some("127.0.0.1"))],
+        ));
+        config.spec.services.push(test_service_with_port(cluster_port(
+            8080,
+            "tcp",
+            Some("::ffff:127.0.0.1"),
+        )));
+        let Err(err) = validate(&config) else {
+            std::process::abort();
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already mapped by cluster"),
+            "expected the mapped and plain forms to collide, got: {msg}"
+        );
+    }
+
+    /// Loopback in the two families is genuinely two addresses, so it passes.
+    #[test]
+    fn ipv6_loopback_and_ipv4_loopback_pass() {
+        let mut config = base_config();
+        config.spec.clusters.push(test_cluster_with_ports(
+            "alpha",
+            vec![cluster_port(8080, "tcp", Some("::1"))],
+        ));
+        config
+            .spec
+            .services
+            .push(test_service_with_port(cluster_port(8080, "tcp", Some("127.0.0.1"))));
         validate(&config).unwrap_or_else(|_e| {
             std::process::abort();
         });

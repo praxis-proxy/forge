@@ -339,7 +339,10 @@ pub struct PortMapping {
     pub host: u16,
     /// Container port.
     pub container: u16,
-    /// Protocol (tcp or udp).
+    /// Port protocol.
+    ///
+    /// Cluster mappings accept `tcp`, `udp` or `sctp` (case-insensitive),
+    /// matching what KIND supports. Service ports accept `tcp` only.
     #[serde(default = "default_protocol")]
     pub protocol: String,
 }

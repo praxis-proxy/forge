@@ -137,9 +137,10 @@ pub fn run_kubectl(runner: &dyn CommandRunner, kind_name: &str, args: &[String])
 
 /// Generate a KIND cluster config YAML from a [`NodeConfig`].
 ///
-/// When `ports` is non-empty, `extraPortMappings` entries are added
-/// to the first control-plane node (KIND only supports port mappings
-/// on control-plane nodes).
+/// When `ports` is non-empty, `extraPortMappings` entries are added to the
+/// first control-plane node. KIND accepts the field on any node; one node is
+/// enough because kube-proxy makes a `NodePort` reachable through every node,
+/// and publishing the same host port from several nodes would collide.
 pub fn generate_kind_config(nodes: &NodeConfig, ports: &[PortMapping]) -> String {
     let mut yaml = String::from("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n");
     for idx in 0..nodes.control_planes {
