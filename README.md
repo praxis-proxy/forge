@@ -4,28 +4,16 @@ Development environment orchestration tool for Praxis development and testing.
 
 ## Summary
 
-Forge is a standalone, project-neutral CLI for creating and managing
-reproducible local Kubernetes environments. It provisions KIND clusters,
-Docker or Podman networks, host services, and declarative deployment stacks
-using a versioned `forge.yaml` configuration.
-
-Forge is extracted from Grid but does not depend on Grid or deploy Grid
-runtime components. Grid, demos, and MaaS/IPP define their own Forge
-configurations and remain responsible for topology-specific assertions and
-runtime behavior. The supported CLI, configuration schema, cleanup ownership,
-evidence paths, and non-interactive workflows remain compatible with the
-in-tree implementation.
+Forge is a standalone CLI for creating and managing reproducible local
+Kubernetes environments. It provisions KIND clusters, Docker or Podman networks,
+host services, and declarative deployment stacks using a versioned `forge.yaml`
+configuration. The primary purpose of which is to test Praxis builds and
+derivatives.
 
 Forge reads a single `forge.yaml` file and brings up reproducible local
 environments: Docker/Podman networks, KIND clusters, host-level container
 services, and multi-step deployment stacks (kubectl, Helm, kustomize,
 templates, and exec steps). It is a synchronous CLI with no async runtime.
-
-Forge is **project-neutral**. It does not contain Grid routing/scoring/SWIM
-assertions, Grid operator deployment semantics, Grid-specific overlay
-assertions, Grid-specific topology orchestration, or MaaS/IPP-specific
-runtime assertions. Those belong in consumer repositories that define their
-own `forge.yaml` configurations.
 
 ## Installation
 
