@@ -1,107 +1,53 @@
-# Contributing to Praxis Forge
+# Contributing
 
-Thank you for your interest in contributing to Praxis Forge! We welcome
-contributions of all kinds: code, documentation, bug reports, and feature
-proposals.
+Thank you for your interest in contributing! Start by
+reading the [development conventions]. Submissions that
+do not follow the conventions will be rejected.
 
-## Prerequisites
-
-- Rust stable 1.96+
-- Docker 29.3.0+ or Podman (for integration testing)
-- `kind` (for the path-independence tests, which run `forge status`; those
-  tests skip with a note on stderr when `kind get clusters` does not succeed)
+[development conventions]: docs/conventions.md
 
 ## Getting Started
 
-1. Fork the repository and clone your fork.
-2. Build the project: `make build`.
-3. Run the tests: `make test`.
+1. Fork the repository and clone your fork
+2. Install pre-commit hooks: `make setup-hooks`
+3. Build and test: `make build && make test`
+4. Run every gate locally before pushing: `make all`
 
-## Quick Reference
+Requirements are listed in [docs/development.md].
 
-```console
-make build          # build Forge
-make test           # all tests
-make fmt            # format with rustfmt
-make lint           # clippy + format check
-make doc            # build docs with warnings denied
-make release        # build the release binary
-```
+[docs/development.md]: docs/development.md
 
-## Developer Certificate of Origin
+## Picking Up an Issue
 
-> **WARNING**: TBD - not currently in effect; we're waiting on CNCF sandbox
-> submission.
+Only issues a maintainer has triaged (given a milestone
+and added to a project board) are open for contributors
+to take, and only at `Medium` or `Low` priority. Urgent
+and high-priority work is assigned by maintainers. If you
+self-assign something outside these rules, a bot unassigns
+it and points you back here. See [Picking Up Work] for the
+full policy.
 
-All commits must be signed off per the
-[Developer Certificate of Origin][dco] (DCO). This certifies that you have
-the right to submit the contribution under the project's license.
+[Picking Up Work]: docs/development.md#picking-up-work
 
-Sign off by adding `-s` to your commit command:
+## Larger Changes
 
-```console
-git commit -s -m "your commit message"
-```
+Features that span multiple PRs, introduce new
+architectural patterns, or affect the public interface
+go through the [proposal process].
 
-This adds a `Signed-off-by` trailer with your name and email. Commits without
-sign-off may be rejected by CI.
+[proposal process]: https://github.com/praxis-proxy/enhancements/blob/main/docs/process.md
 
-## Pull Request Process
+## Pull Request Gates
 
-1. Open an issue first for non-trivial changes.
-2. Create a feature branch from `main`.
-3. Keep commits focused; each commit should represent one logical change.
-4. Run `make lint` and `make test` locally before submitting.
-5. Submit a pull request with a clear description of the change and its
-   motivation.
+CI enforces reviewability on every PR:
 
-## Commit Messages
+- A maximum added lines count of production code (tests, docs, examples excluded)
+- A real description of what and why - `Signed-off-by`
+  trailer on every commit (`git commit -s`)
+- Cryptographically signed commits (GPG or SSH)
+- Human authorship: commits authored or signed-off by tools are rejected
+- Conventional commit subjects (`type(scope): summary`, ≤72 chars)
 
-- Use imperative mood ("Add config validation", not "Added").
-- Keep the subject line under 50 characters.
-- Wrap the body at 72 characters and explain why, not only what.
-- Reference issues with `Fixes #123` or `Relates to #456`.
+See the [PR conventions] section for details and override labels.
 
-## Code Style
-
-Forge enforces a strict coding style. Key points:
-
-- `#![deny(unsafe_code)]` in the crate root.
-- Clippy with `-D warnings` (zero tolerance for lint violations).
-- Format with `cargo fmt`.
-- Errors via `thiserror`.
-- Comments answer "why?", never "what?".
-
-## Testing Requirements
-
-New capabilities require:
-
-1. Unit tests covering the implementation.
-2. Integration tests proving CLI behavior end to end.
-3. Compatibility tests for representative environment configurations.
-4. Path-independence tests proving standalone operation.
-
-A feature without appropriate tests is not complete.
-
-## Code Responsibility
-
-Every contributor is responsible for the correctness and security of the code
-they submit, regardless of how it was produced. AI-assisted code must be
-human-reviewed and tested before submission.
-
-Signed-off commits represent your assertion that you have reviewed and fully
-understand the changes you are submitting.
-
-## Communication
-
-- [GitHub Issues][issues] for bugs and feature requests.
-- [GitHub Discussions][discussions] for questions and design.
-
-## License
-
-By contributing, you agree that your contributions will be licensed under
-the Apache License, Version 2.0.
-
-[dco]: https://developercertificate.org/
-[issues]: https://github.com/praxis-proxy/forge/issues
-[discussions]: https://github.com/orgs/praxis-proxy/discussions
+[PR conventions]: docs/conventions.md#pull-request-conventions
