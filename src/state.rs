@@ -57,6 +57,18 @@ pub struct ForgeState {
     /// Managed container network state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkState>,
+    /// Whether this state owns the tracked network creation.
+    /// Missing historical provenance never authorizes network removal.
+    #[serde(default)]
+    pub network_created_by_forge: bool,
+    /// Runtime identity returned when the tracked network was created.
+    /// Legacy state without this identity never authorizes network deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
+    /// Correlation label persisted before a network creation attempt.
+    /// It permits interrupted identity lookup to recover only that attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_creation_token: Option<String>,
     /// Detected container runtime name, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
@@ -248,6 +260,9 @@ pub fn empty() -> ForgeState {
         services: Vec::new(),
         stacks: Vec::new(),
         network: None,
+        network_created_by_forge: false,
+        network_id: None,
+        network_creation_token: None,
         runtime: None,
         config_digest: None,
         last_operation: None,
@@ -868,5 +883,37 @@ mod tests {
             timestamp: 0,
             error: None,
         }
+    }
+
+    #[test]
+    fn grid_state_preserves_network_creation_provenance() -> Result<(), serde_json::Error> {
+        let mut document = serde_json::to_value(empty())?;
+        let fields = document.as_object_mut().unwrap_or_else(|| std::process::abort());
+        fields.insert("networkCreatedByForge".to_owned(), serde_json::json!(true));
+        let state: ForgeState = serde_json::from_value(document)?;
+        assert!(
+            state.network_created_by_forge,
+            "Grid's persisted ownership must survive migration"
+        );
+        let encoded = serde_json::to_value(state)?;
+        assert_eq!(
+            encoded.get("networkCreatedByForge"),
+            Some(&serde_json::json!(true)),
+            "ownership must round trip"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn historical_state_without_provenance_does_not_authorize_network_deletion() -> Result<(), serde_json::Error> {
+        let mut document = serde_json::to_value(empty())?;
+        let fields = document.as_object_mut().unwrap_or_else(|| std::process::abort());
+        fields.remove("networkCreatedByForge");
+        let state: ForgeState = serde_json::from_value(document)?;
+        assert!(
+            !state.network_created_by_forge,
+            "absent historical ownership must be conservative"
+        );
+        Ok(())
     }
 }

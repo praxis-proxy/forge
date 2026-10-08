@@ -240,6 +240,20 @@ struct NetworkTeardown {
     name: String,
     /// Whether this was a dry-run skip.
     dry_run: bool,
+    /// Intended network disposition.
+    action: NetworkAction,
+}
+
+/// Network disposition after teardown.
+enum NetworkAction {
+    /// Delete a network owned by the active lifecycle.
+    Remove,
+    /// Retain a network whose creation is not owned.
+    Preserve,
+    /// The tracked network is already absent.
+    Absent,
+    /// A dry run must inspect a pending attempt before deciding deletion.
+    Recover,
 }
 
 /// Remove the environment network if one is tracked in state.
@@ -252,19 +266,71 @@ fn remove_env_network(
         _ => return Ok(None),
     };
     if ctx.dry_run {
+        let action = planned_network_action(state);
         return Ok(Some(NetworkTeardown {
             name: net.name,
             dry_run: true,
+            action,
         }));
     }
-    let binary = resolve_binary(ctx, state)?;
-    let env_name = &ctx.config.metadata.name;
-    networking::remove_network(ctx.runner, &binary, &net.name, env_name)?;
-    mark_network_gone(state);
+    let action = remove_owned_network(ctx, state, &net.name)?;
+    if matches!(action, NetworkAction::Preserve) {
+        state.network_created_by_forge = false;
+        state.network_id = None;
+        state.network_creation_token = None;
+    } else {
+        mark_network_gone(state);
+    }
     Ok(Some(NetworkTeardown {
         name: net.name,
         dry_run: false,
+        action,
     }))
+}
+
+/// Describe the required identity check without contacting the runtime.
+fn planned_network_action(state: &state::ForgeState) -> NetworkAction {
+    if state.network_created_by_forge && state.network_id.is_some() {
+        NetworkAction::Remove
+    } else if state.network_creation_token.is_some() {
+        NetworkAction::Recover
+    } else {
+        NetworkAction::Preserve
+    }
+}
+
+/// Compare the live instance with persisted creation authority before deletion.
+fn remove_owned_network(
+    ctx: &ForgeContext<'_>,
+    state: &state::ForgeState,
+    name: &str,
+) -> Result<NetworkAction, ForgeError> {
+    let binary = resolve_binary(ctx, state)?;
+    if !networking::network_exists(ctx.runner, &binary, name)? {
+        return Ok(NetworkAction::Absent);
+    }
+    let Some(current) = owned_network_id(ctx, state, &binary, name)? else {
+        return Ok(NetworkAction::Preserve);
+    };
+    networking::remove_network(ctx.runner, &binary, &current, &ctx.config.metadata.name)?;
+    Ok(NetworkAction::Remove)
+}
+
+/// Recover only an exact saved instance or a matching pending creation attempt.
+fn owned_network_id(
+    ctx: &ForgeContext<'_>,
+    state: &state::ForgeState,
+    binary: &str,
+    name: &str,
+) -> Result<Option<String>, ForgeError> {
+    if let Some(recorded) = state.network_id.as_ref().filter(|_| state.network_created_by_forge) {
+        let current = networking::inspect_network_id(ctx.runner, binary, name)?;
+        return Ok((*recorded == current).then_some(current));
+    }
+    if let Some(token) = state.network_creation_token.as_deref() {
+        return networking::recover_network_id(ctx.runner, binary, name, &ctx.config.metadata.name, token);
+    }
+    Ok(None)
 }
 
 /// Get the runtime binary from state or by re-detecting.
@@ -278,6 +344,9 @@ fn resolve_binary(ctx: &ForgeContext<'_>, state: &state::ForgeState) -> Result<S
 
 /// Mark the network as gone in state.
 fn mark_network_gone(state: &mut state::ForgeState) {
+    state.network_created_by_forge = false;
+    state.network_id = None;
+    state.network_creation_token = None;
     if let Some(ref mut ns) = state.network {
         ns.phase = NetworkPhase::Gone;
         ns.cidr = None;
@@ -319,7 +388,7 @@ fn render_json(
     if let (Some(nd), Some(obj)) = (net, data.as_object_mut()) {
         obj.insert(
             "network".to_owned(),
-            serde_json::json!({ "name": nd.name, "dryRun": nd.dry_run }),
+            serde_json::json!({ "name": nd.name, "dryRun": nd.dry_run, "removed": !nd.dry_run && matches!(nd.action, NetworkAction::Remove) }),
         );
     }
     let envelope = output::success(data);
@@ -373,11 +442,23 @@ fn format_svc_text(svc: &SvcDeleteResult) -> String {
 }
 
 /// Format a network teardown result as a text line.
-fn format_net_text(net: &NetworkTeardown) -> String {
-    if net.dry_run {
-        return format!("would remove network '{}'", net.name);
+fn format_net_text(n: &NetworkTeardown) -> String {
+    if n.dry_run {
+        let action = match n.action {
+            NetworkAction::Preserve => "preserve pre-existing",
+            NetworkAction::Remove => "remove",
+            NetworkAction::Absent => "observe absence of",
+            NetworkAction::Recover => "verify pending creation before removing",
+        };
+        return format!("would {action} network '{}'", n.name);
     }
-    format!("removed network '{}'", net.name)
+    if matches!(n.action, NetworkAction::Remove) {
+        return format!("removed network '{}'", n.name);
+    }
+    if matches!(n.action, NetworkAction::Absent) {
+        return format!("network '{}' is already absent", n.name);
+    }
+    format!("preserved pre-existing network '{}'", n.name)
 }
 
 /// Format a single result as text.
@@ -535,6 +616,8 @@ spec:
             context: "kind-forge-hub".to_owned(),
             phase: ClusterPhase::Running,
         });
+        st.network_created_by_forge = true;
+        st.network_id = Some("a".repeat(64));
         st.network = Some(state::NetworkState {
             name: "test-net".to_owned(),
             phase: NetworkPhase::Active,
@@ -551,6 +634,20 @@ spec:
             stdout: r#"{"forge.managed":"true","forge.environment":"test"}"#.to_owned(),
             stderr: String::new(),
         }
+    }
+
+    /// Respond with a particular runtime network identity.
+    fn respond_network_instance(runner: &mut MockRunner, digit: char) {
+        let id = digit.to_string().repeat(64);
+        runner.respond(
+            "docker network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: format!(r#"{{"Id":"{id}"}}"#),
+                stderr: String::new(),
+            },
+        );
+        runner.respond(&format!("docker network inspect {id}"), ok());
     }
 
     /// Successful empty output.
@@ -582,11 +679,15 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'a');
         runner.respond(
-            "docker network inspect test-net --format {{json .Labels}}",
+            &format!(
+                "docker network inspect {} --format {{{{json .Labels}}}}",
+                "a".repeat(64)
+            ),
             owned_labels(),
         );
-        runner.respond("docker network rm test-net", ok());
+        runner.respond(&format!("docker network rm {}", "a".repeat(64)), ok());
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -774,10 +875,14 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'a');
         // The network belongs to another environment, so removal fails
         // after the clusters were already deleted.
         runner.respond(
-            "docker network inspect test-net --format {{json .Labels}}",
+            &format!(
+                "docker network inspect {} --format {{{{json .Labels}}}}",
+                "a".repeat(64)
+            ),
             foreign_labels(),
         );
         let ctx = test_ctx(&runner, &config, &dir);
@@ -822,5 +927,192 @@ spec:
             text.contains("would remove network"),
             "should report would remove network: {text}"
         );
+    }
+
+    #[test]
+    fn forced_down_preserves_reused_network() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_state_with_network(directory.path());
+        let mut state = state::load(directory.path())?;
+        state.network_created_by_forge = false;
+        state::save(directory.path(), &state)?;
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'a');
+        let output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(
+            !runner.was_called("network rm"),
+            "force suppresses confirmation without granting ownership"
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("preserved pre-existing network"),
+            "preservation must be explicit"
+        );
+        let retained = state::load(directory.path())?;
+        assert_eq!(
+            retained.network.as_ref().map(|net| &net.phase),
+            Some(&NetworkPhase::Active),
+            "retained network stays active"
+        );
+        Ok(())
+    }
+    /// Run forced teardown with explicit runtime responses and persisted state.
+    fn run_forced_network_teardown(runner: &MockRunner, directory: &std::path::Path) -> Result<Vec<u8>, ForgeError> {
+        let config = test_config();
+        let context = ForgeContext {
+            runner,
+            config: &config,
+            state_dir: directory.to_path_buf(),
+            config_dir: directory.to_path_buf(),
+            format: OutputFormat::Text,
+            dry_run: false,
+        };
+        let mut output = Vec::new();
+        run(&context, true, &mut output)?;
+        Ok(output)
+    }
+
+    #[test]
+    fn dry_run_reports_prospective_network_preservation() {
+        let teardown = NetworkTeardown {
+            name: "reused-net".to_owned(),
+            dry_run: true,
+            action: NetworkAction::Preserve,
+        };
+        assert_eq!(
+            format_net_text(&teardown),
+            "would preserve pre-existing network 'reused-net'",
+            "dry-run output must not imply observed preservation"
+        );
+    }
+
+    #[test]
+    fn down_preserves_replaced_network_instance() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_state_with_network(directory.path());
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'b');
+        let _output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(
+            !runner.was_called("network rm"),
+            "matching names cannot authorize deleting replacement networks"
+        );
+        let state = state::load(directory.path())?;
+        assert!(!state.network_created_by_forge, "replacement revokes stale ownership");
+        assert!(state.network_id.is_none(), "replacement must not transfer its identity");
+        assert!(
+            state.clusters.iter().all(|cluster| cluster.phase == ClusterPhase::Gone),
+            "cluster cleanup still completes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn down_preserves_legacy_network_without_instance_id() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_state_with_network(directory.path());
+        let mut state = state::load(directory.path())?;
+        state.network_id = None;
+        state::save(directory.path(), &state)?;
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond("docker network inspect test-net", ok());
+        let _output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(
+            !runner.was_called("network rm"),
+            "legacy true flag cannot distinguish runtime instances"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn down_accepts_an_already_absent_owned_network() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_state_with_network(directory.path());
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond(
+            "docker network inspect test-net",
+            CommandOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "Error: No such network: test-net".to_owned(),
+            },
+        );
+        let _output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(!runner.was_called("network rm"), "absent networks require no deletion");
+        assert_network_allocation_cleared(directory.path());
+        Ok(())
+    }
+
+    #[test]
+    fn down_recovers_an_interrupted_creation_by_its_label() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_pending_creation(directory.path())?;
+        let runner = pending_creation_runner("original-attempt");
+        let _output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(
+            runner.was_called(&format!("network rm {}", "a".repeat(64))),
+            "cleanup must target the recovered immutable ID"
+        );
+        let state = state::load(directory.path())?;
+        assert!(state.network_creation_token.is_none(), "cleanup clears pending attempt");
+        assert_network_allocation_cleared(directory.path());
+        Ok(())
+    }
+
+    #[test]
+    fn down_preserves_a_replacement_of_an_interrupted_creation() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_pending_creation(directory.path())?;
+        let runner = pending_creation_runner("another-attempt");
+        let _output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(
+            !runner.was_called("network rm"),
+            "same environment and name cannot transfer pending ownership"
+        );
+        Ok(())
+    }
+
+    /// Persist a failed identity lookup after successful external creation.
+    fn seed_pending_creation(directory: &std::path::Path) -> Result<(), ForgeError> {
+        seed_state_with_network(directory);
+        let mut state = state::load(directory)?;
+        state.network_created_by_forge = false;
+        state.network_id = None;
+        state.network_creation_token = Some("original-attempt".to_owned());
+        state::save(directory, &state)
+    }
+
+    /// Supply successful immutable-ID cleanup and a selectable creation label.
+    fn pending_creation_runner(token: &str) -> MockRunner {
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'a');
+        runner.respond(
+            "docker network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: serde_json::json!({
+                    "Id": "a".repeat(64),
+                    "Labels": {"forge.managed": "true", "forge.environment": "test", "forge.creation": token}
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        );
+        runner.respond(
+            &format!(
+                "docker network inspect {} --format {{{{json .Labels}}}}",
+                "a".repeat(64)
+            ),
+            owned_labels(),
+        );
+        runner.respond(&format!("docker network rm {}", "a".repeat(64)), ok());
+        runner
     }
 }

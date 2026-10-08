@@ -403,15 +403,10 @@ pub fn parse_network_cidr(inspect_output: &str) -> Result<String, ForgeError> {
     extract_subnet_from_ipam(entry)
 }
 
-/// Navigate the nested IPAM config to extract and validate the first subnet.
+/// Extract and validate the first IPv4 subnet of an inspected network.
 fn extract_subnet_from_ipam(entry: &serde_json::Value) -> Result<String, ForgeError> {
-    let subnet = entry
-        .get("IPAM")
-        .and_then(|ipam| ipam.get("Config"))
-        .and_then(|config| config.get(0))
-        .and_then(|cfg| cfg.get("Subnet"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| cmd_error("network inspect", "no Subnet in IPAM.Config"))?;
+    let subnet = crate::networking::first_ipv4_subnet(entry)
+        .ok_or_else(|| cmd_error("network inspect", "no IPv4 subnet in IPAM.Config or subnets"))?;
     parse_cidr_parts(subnet)
         .map_err(|_err| cmd_error("network inspect", &format!("invalid CIDR in IPAM.Config: {subnet:?}")))?;
     Ok(subnet.to_owned())
@@ -926,5 +921,16 @@ mod tests {
         let name_c = conn_check_pod_name("svc.a.forge.test", 443);
         assert_ne!(name_a, name_b, "different targets should produce different pod names");
         assert_ne!(name_a, name_c, "different ports should produce different pod names");
+    }
+
+    #[test]
+    fn metallb_cidr_accepts_podman_ipv6_first_result() -> Result<(), ForgeError> {
+        let input = r#"[{"subnets":[{"subnet":"fd00::/64"},{"subnet":"10.89.0.0/24"}]}]"#;
+        assert_eq!(
+            parse_network_cidr(input)?,
+            "10.89.0.0/24",
+            "MetalLB allocation must preserve Grid's Podman support"
+        );
+        Ok(())
     }
 }

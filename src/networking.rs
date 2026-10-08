@@ -4,7 +4,10 @@
 //! environments.  All commands are structured [`CommandSpec`] values
 //! executed through [`CommandRunner`].  No shell strings.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, hash_map::RandomState},
+    hash::BuildHasher as _,
+};
 
 use crate::{
     command::runner::{CommandOutput, CommandRunner, CommandSpec},
@@ -44,8 +47,10 @@ pub fn network_name(env_name: &str) -> String {
 
 /// Create a container network with ownership labels.
 ///
-/// Idempotent: returns `Ok(())` if the network already exists
-/// and is owned by this environment.
+/// Returns the runtime network ID only when this call creates the network.
+/// An existing network must have matching ownership labels and returns `None`.
+/// The caller must checkpoint `creation_token` before calling: an error after
+/// successful creation leaves that marker available for safe identity recovery.
 ///
 /// # Errors
 ///
@@ -56,13 +61,34 @@ pub fn create_network(
     binary: &str,
     net_name: &str,
     env_name: &str,
-) -> Result<(), ForgeError> {
+    creation_token: &str,
+) -> Result<Option<String>, ForgeError> {
     if network_exists(runner, binary, net_name)? {
-        return verify_ownership(runner, binary, net_name, env_name);
+        verify_ownership(runner, binary, net_name, env_name)?;
+        return Ok(None);
     }
-    let spec = create_spec(binary, net_name, env_name);
+    if creation_token.is_empty() {
+        return Err(ForgeError::State(
+            "network creation requires a persisted attempt token".to_owned(),
+        ));
+    }
+    let spec = create_spec(binary, net_name, env_name, creation_token);
     let output = runner.run(&spec)?;
-    check_success(&output, "network create")
+    check_success(&output, "network create")?;
+    if std::path::Path::new(binary)
+        .file_name()
+        .is_some_and(|name| name == "podman")
+    {
+        return recover_network_id(runner, binary, net_name, env_name, creation_token)?.map_or_else(
+            || {
+                Err(ForgeError::State(
+                    "created network was replaced before identity lookup".to_owned(),
+                ))
+            },
+            |id| Ok(Some(id)),
+        );
+    }
+    validate_network_id(output.stdout.trim()).map(|id| Some(id.to_owned()))
 }
 
 /// Remove a container network after verifying ownership.
@@ -146,6 +172,82 @@ pub fn inspect_network_cidr(runner: &dyn CommandRunner, binary: &str, net_name: 
     parse_ipam_config(&output.stdout)
 }
 
+/// Inspect the immutable runtime identity of a named network.
+///
+/// # Errors
+///
+/// Returns [`ForgeError`] if inspection fails or contains no full network ID.
+pub fn inspect_network_id(runner: &dyn CommandRunner, binary: &str, name: &str) -> Result<String, ForgeError> {
+    let output = runner.run(&cidr_spec(binary, name))?;
+    check_success(&output, "network inspect")?;
+    let value: serde_json::Value = serde_json::from_str(&output.stdout)
+        .map_err(|error| ForgeError::State(format!("cannot parse network identity: {error}")))?;
+    let object = value.get(0).unwrap_or(&value);
+    network_id_from_object(object)
+}
+
+/// Generate an opaque correlation marker for one creation attempt.
+/// This is an identity marker, not an authentication credential.
+pub(crate) fn creation_token() -> String {
+    let randomness = RandomState::new();
+    format!(
+        "{:016x}{:016x}",
+        randomness.hash_one("first"),
+        randomness.hash_one("second")
+    )
+}
+
+/// Recover an interrupted creation only when its persisted label matches.
+/// Both identity and labels come from the same runtime inspection response.
+pub(crate) fn recover_network_id(
+    runner: &dyn CommandRunner,
+    binary: &str,
+    name: &str,
+    environment: &str,
+    token: &str,
+) -> Result<Option<String>, ForgeError> {
+    let output = runner.run(&cidr_spec(binary, name))?;
+    check_success(&output, "network inspect")?;
+    let value: serde_json::Value = serde_json::from_str(&output.stdout)
+        .map_err(|error| ForgeError::State(format!("cannot parse network identity: {error}")))?;
+    let object = value.get(0).unwrap_or(&value);
+    let labels = object.get("Labels").or_else(|| object.get("labels"));
+    if token.is_empty()
+        || labels
+            .and_then(|map| map.get("forge.creation"))
+            .and_then(serde_json::Value::as_str)
+            != Some(token)
+    {
+        return Ok(None);
+    }
+    let labels: BTreeMap<String, String> = serde_json::from_value(labels.cloned().unwrap_or_default())
+        .map_err(|error| ForgeError::State(format!("cannot parse network labels: {error}")))?;
+    check_label(&labels, "forge.managed", "true", name)?;
+    check_label(&labels, "forge.environment", environment, name)?;
+    network_id_from_object(object).map(Some)
+}
+
+/// Validate the identity member shared by Docker and Podman inspection output.
+fn network_id_from_object(object: &serde_json::Value) -> Result<String, ForgeError> {
+    let id = object
+        .get("Id")
+        .or_else(|| object.get("ID"))
+        .or_else(|| object.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ForgeError::State("network inspect omitted its runtime ID".to_owned()))?;
+    validate_network_id(id).map(ToOwned::to_owned)
+}
+
+/// Accept only the full hexadecimal runtime ID, never a reusable network name.
+fn validate_network_id(id: &str) -> Result<&str, ForgeError> {
+    if id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(id);
+    }
+    Err(ForgeError::State(
+        "network runtime ID must contain 64 hexadecimal characters".to_owned(),
+    ))
+}
+
 // ---------------------------------------------------------------
 // Ownership
 // ---------------------------------------------------------------
@@ -200,7 +302,7 @@ fn missing_label(net_name: &str, key: &str) -> ForgeError {
 // ---------------------------------------------------------------
 
 /// Build a `<binary> network create` command spec with labels.
-fn create_spec(binary: &str, net_name: &str, env_name: &str) -> CommandSpec {
+fn create_spec(binary: &str, net_name: &str, env_name: &str, creation_token: &str) -> CommandSpec {
     CommandSpec {
         program: binary.into(),
         args: vec![
@@ -210,6 +312,8 @@ fn create_spec(binary: &str, net_name: &str, env_name: &str) -> CommandSpec {
             "forge.managed=true".into(),
             "--label".into(),
             format!("forge.environment={env_name}").into(),
+            "--label".into(),
+            format!("forge.creation={creation_token}").into(),
             net_name.into(),
         ],
         env: BTreeMap::default(),
@@ -266,7 +370,7 @@ fn cidr_spec(binary: &str, net_name: &str) -> CommandSpec {
             "inspect".into(),
             net_name.into(),
             "--format".into(),
-            "{{json .IPAM.Config}}".into(),
+            "{{json .}}".into(),
         ],
         env: BTreeMap::default(),
         stdin: None,
@@ -292,17 +396,28 @@ fn parse_labels(stdout: &str) -> Result<BTreeMap<String, String>, ForgeError> {
     serde_json::from_str(trimmed).map_err(|err| ForgeError::State(format!("cannot parse network labels: {err}")))
 }
 
-/// Parse and validate the first IPv4 subnet in a formatted IPAM config.
+/// Parse and validate the first IPv4 subnet in `network inspect` JSON.
 fn parse_ipam_config(stdout: &str) -> Result<String, ForgeError> {
-    let config: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
+    let network: serde_json::Value = serde_json::from_str(stdout.trim())
         .map_err(|err| ForgeError::State(format!("cannot parse network IPAM config: {err}")))?;
-    let subnet = config
-        .first()
-        .and_then(|entry| entry.get("Subnet"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ForgeError::State("network IPAM config has no subnet".to_owned()))?;
+    let subnet = first_ipv4_subnet(&network)
+        .ok_or_else(|| ForgeError::State("network IPAM config has no IPv4 subnet".to_owned()))?;
     validate_ipv4_cidr(subnet)?;
     Ok(subnet.to_owned())
+}
+
+/// First IPv4 subnet of an inspected network, in Docker (`IPAM.Config[].Subnet`) or Podman (`subnets[].subnet`) shape.
+pub(crate) fn first_ipv4_subnet(network: &serde_json::Value) -> Option<&str> {
+    let network = network.as_array().and_then(|all| all.first()).unwrap_or(network);
+    let docker = network.pointer("/IPAM/Config").and_then(serde_json::Value::as_array);
+    let podman = network.get("subnets").and_then(serde_json::Value::as_array);
+    docker
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("Subnet"))
+        .chain(podman.into_iter().flatten().filter_map(|entry| entry.get("subnet")))
+        .filter_map(serde_json::Value::as_str)
+        .find(|subnet| !subnet.contains(':'))
 }
 
 /// Validate an IPv4 CIDR without accepting host-only or IPv6 forms.
@@ -380,7 +495,7 @@ mod tests {
     fn ipam_config(cidr: &str) -> CommandOutput {
         CommandOutput {
             status: 0,
-            stdout: format!(r#"[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]"#),
+            stdout: format!(r#"{{"IPAM":{{"Config":[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]}}}}"#),
             stderr: String::new(),
         }
     }
@@ -396,8 +511,17 @@ mod tests {
         let mut runner = MockRunner::new();
         runner.respond("docker network inspect test-net", not_found());
         runner.respond("docker", ok());
+        runner.respond(
+            "docker network create --label forge.managed=true --label forge.environment=test --label forge.creation=attempt test-net",
+            CommandOutput {
+                status: 0,
+                stdout: "a".repeat(64),
+                stderr: String::new(),
+            },
+        );
 
-        create_network(&runner, "docker", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        let _created =
+            create_network(&runner, "docker", "test-net", "test", "attempt").unwrap_or_else(|_| std::process::abort());
         assert!(runner.was_called("network create"), "should call network create");
         assert!(runner.was_called("forge.managed=true"), "should include managed label");
         assert!(runner.was_called("forge.environment=test"), "should include env label");
@@ -412,7 +536,8 @@ mod tests {
             owned_labels("test"),
         );
 
-        create_network(&runner, "docker", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        let _created =
+            create_network(&runner, "docker", "test-net", "test", "attempt").unwrap_or_else(|_| std::process::abort());
         assert!(
             !runner.was_called("network create"),
             "should not create existing network"
@@ -428,7 +553,7 @@ mod tests {
             owned_labels("other-env"),
         );
 
-        let result = create_network(&runner, "docker", "test-net", "test");
+        let result = create_network(&runner, "docker", "test-net", "test", "attempt");
         let Err(err) = result else {
             std::process::abort();
         };
@@ -448,7 +573,7 @@ mod tests {
             foreign_labels(),
         );
 
-        let result = create_network(&runner, "docker", "test-net", "test");
+        let result = create_network(&runner, "docker", "test-net", "test", "attempt");
         assert!(result.is_err(), "should reject unmanaged network");
     }
 
@@ -599,7 +724,7 @@ mod tests {
     fn inspect_network_cidr_reads_formatted_ipam_config() {
         let mut runner = MockRunner::new();
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            "docker network inspect test-net --format {{json .}}",
             ipam_config("172.18.0.0/16"),
         );
 
@@ -611,7 +736,7 @@ mod tests {
     fn inspect_network_cidr_rejects_invalid_subnet() {
         let mut runner = MockRunner::new();
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            "docker network inspect test-net --format {{json .}}",
             ipam_config("fd00::/64"),
         );
 
@@ -698,7 +823,87 @@ mod tests {
         runner.respond("podman network inspect test-net", not_found());
         runner.respond("podman", ok());
 
-        create_network(&runner, "podman", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        runner.respond(
+            "podman network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: serde_json::json!({
+                    "id": "a".repeat(64),
+                    "labels": {"forge.managed": "true", "forge.environment": "test", "forge.creation": "attempt"}
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        );
+        let _created =
+            create_network(&runner, "podman", "test-net", "test", "attempt").unwrap_or_else(|_| std::process::abort());
         assert!(runner.was_called("podman"), "should use podman binary");
+    }
+
+    #[test]
+    fn network_cidr_accepts_docker_and_podman_ipv6_first_results() -> Result<(), ForgeError> {
+        for json in [
+            r#"{"IPAM":{"Config":[{"Subnet":"fd00::/64"},{"Subnet":"172.18.0.0/16"}]}}"#,
+            r#"{"subnets":[{"subnet":"fd00::/64"},{"subnet":"172.18.0.0/16"}]}"#,
+            r#"[{"subnets":[{"subnet":"fd00::/64"},{"subnet":"172.18.0.0/16"}]}]"#,
+        ] {
+            assert_eq!(
+                parse_ipam_config(json)?,
+                "172.18.0.0/16",
+                "IPv4 allocator must skip preceding IPv6 for both runtimes"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn network_identity_accepts_runtime_inspect_shapes() -> Result<(), ForgeError> {
+        let id = "a".repeat(64);
+        for json in [
+            format!(r#"{{"Id":"{id}"}}"#),
+            format!(r#"{{"id":"{id}"}}"#),
+            format!(r#"[{{"ID":"{id}"}}]"#),
+        ] {
+            let mut runner = MockRunner::new();
+            runner.respond(
+                "docker",
+                CommandOutput {
+                    status: 0,
+                    stdout: json,
+                    stderr: String::new(),
+                },
+            );
+            assert_eq!(inspect_network_id(&runner, "docker", "test-net")?, id);
+        }
+        assert!(
+            validate_network_id("test-net").is_err(),
+            "a reusable name is not an identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn podman_creation_rejects_a_replacement_before_identity_lookup() {
+        let mut runner = MockRunner::new();
+        runner.respond("podman network inspect test-net", not_found());
+        runner.respond("podman", ok());
+        runner.respond(
+            "podman network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: serde_json::json!({
+                    "id": "a".repeat(64),
+                    "labels": {"forge.managed": "true", "forge.environment": "test", "forge.creation": "replacement"}
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        );
+        let result = create_network(&runner, "podman", "test-net", "test", "attempt");
+        assert!(
+            matches!(result, Err(ForgeError::State(_))),
+            "name reuse cannot authorize a replacement"
+        );
+        assert!(!runner.was_called("network rm"), "replacement must be preserved");
     }
 }
