@@ -162,6 +162,15 @@ labels match. Cleanup still targets the recovered immutable ID. The marker
 correlates lifecycle attempts; it is not a security credential. Old state has no
 marker and retains the conservative preservation behavior above.
 
+Keep the upgraded binary and its matching configuration and state available
+until cleanup finishes. Older Forge versions reject the new ownership fields,
+so replacing the binary alone cannot roll back an active environment. Before
+downgrading, use the upgraded binary to run `down` with the same configuration
+and state directory, then inspect any preserved resources as described above.
+After cleanup, archive the inactive state directory and let the older binary
+start with fresh state. Do not remove provenance fields or restore stale state
+over an active environment to make an older binary accept it.
+
 ## Cleanup behavior
 
 `praxis-forge down` tears down in reverse order: services, clusters, network.
