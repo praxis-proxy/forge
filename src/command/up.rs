@@ -1187,6 +1187,14 @@ spec:
         }
     }
 
+    /// Register the full creation command used by the exact-match mock runner.
+    fn respond_created_network(runner: &mut MockRunner) {
+        runner.respond(
+            "docker network create --label forge.managed=true --label forge.environment=test test-net",
+            created_network(),
+        );
+    }
+
     /// Formatted Docker IPAM response for the test network.
     fn network_cidr(cidr: &str) -> CommandOutput {
         CommandOutput {
@@ -1206,7 +1214,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        runner.respond("docker network create", created_network());
+        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
@@ -1248,7 +1256,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        runner.respond("docker network create", created_network());
+        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
@@ -1303,7 +1311,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        runner.respond("docker network create", created_network());
+        respond_created_network(&mut runner);
         // The network is created, then the CIDR inspect fails. The network is
         // live either way, so it has to be recorded for `down` to remove it.
         runner.respond(
@@ -1489,7 +1497,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        runner.respond("docker network create", created_network());
+        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
@@ -1544,7 +1552,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        runner.respond("docker network create", created_network());
+        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
@@ -1710,7 +1718,7 @@ spec:
     fn network_setup_runner(exists: bool) -> MockRunner {
         let mut runner = MockRunner::new();
         runner.respond("docker", empty_ok());
-        runner.respond("docker network create", created_network());
+        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net",
             if exists { empty_ok() } else { net_not_found() },

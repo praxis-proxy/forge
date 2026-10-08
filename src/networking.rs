@@ -446,7 +446,7 @@ mod tests {
         runner.respond("docker network inspect test-net", not_found());
         runner.respond("docker", ok());
         runner.respond(
-            "docker network create",
+            "docker network create --label forge.managed=true --label forge.environment=test test-net",
             CommandOutput {
                 status: 0,
                 stdout: "a".repeat(64),
