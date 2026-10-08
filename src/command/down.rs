@@ -240,6 +240,8 @@ struct NetworkTeardown {
     name: String,
     /// Whether this was a dry-run skip.
     dry_run: bool,
+    /// Whether the network was removed by this operation.
+    removed: bool,
 }
 
 /// Remove the environment network if one is tracked in state.
@@ -251,10 +253,19 @@ fn remove_env_network(
         Some(ns) if ns.phase != NetworkPhase::Gone => ns.clone(),
         _ => return Ok(None),
     };
+    if !state.network_created_by_forge {
+        verify_pre_existing_network(ctx, state, &net.name)?;
+        return Ok(Some(NetworkTeardown {
+            name: net.name,
+            dry_run: false,
+            removed: false,
+        }));
+    }
     if ctx.dry_run {
         return Ok(Some(NetworkTeardown {
             name: net.name,
             dry_run: true,
+            removed: false,
         }));
     }
     let binary = resolve_binary(ctx, state)?;
@@ -264,7 +275,27 @@ fn remove_env_network(
     Ok(Some(NetworkTeardown {
         name: net.name,
         dry_run: false,
+        removed: true,
     }))
+}
+
+/// Verify that a network marked as pre-existing is still present before
+/// reporting that it was preserved.
+fn verify_pre_existing_network(
+    ctx: &ForgeContext<'_>,
+    state: &state::ForgeState,
+    name: &str,
+) -> Result<(), ForgeError> {
+    if ctx.dry_run {
+        return Ok(());
+    }
+    let binary = resolve_binary(ctx, state)?;
+    if networking::network_exists(ctx.runner, &binary, name)? {
+        return Ok(());
+    }
+    Err(ForgeError::State(format!(
+        "pre-existing network '{name}' is no longer present; refusing to report preservation"
+    )))
 }
 
 /// Get the runtime binary from state or by re-detecting.
@@ -278,6 +309,7 @@ fn resolve_binary(ctx: &ForgeContext<'_>, state: &state::ForgeState) -> Result<S
 
 /// Mark the network as gone in state.
 fn mark_network_gone(state: &mut state::ForgeState) {
+    state.network_created_by_forge = false;
     if let Some(ref mut ns) = state.network {
         ns.phase = NetworkPhase::Gone;
         ns.cidr = None;
@@ -319,7 +351,7 @@ fn render_json(
     if let (Some(nd), Some(obj)) = (net, data.as_object_mut()) {
         obj.insert(
             "network".to_owned(),
-            serde_json::json!({ "name": nd.name, "dryRun": nd.dry_run }),
+            serde_json::json!({ "name": nd.name, "dryRun": nd.dry_run, "removed": nd.removed }),
         );
     }
     let envelope = output::success(data);
@@ -373,11 +405,14 @@ fn format_svc_text(svc: &SvcDeleteResult) -> String {
 }
 
 /// Format a network teardown result as a text line.
-fn format_net_text(net: &NetworkTeardown) -> String {
-    if net.dry_run {
-        return format!("would remove network '{}'", net.name);
+fn format_net_text(n: &NetworkTeardown) -> String {
+    if n.dry_run {
+        return format!("would remove network '{}'", n.name);
     }
-    format!("removed network '{}'", net.name)
+    if n.removed {
+        return format!("removed network '{}'", n.name);
+    }
+    format!("preserved pre-existing network '{}'", n.name)
 }
 
 /// Format a single result as text.
@@ -535,6 +570,7 @@ spec:
             context: "kind-forge-hub".to_owned(),
             phase: ClusterPhase::Running,
         });
+        st.network_created_by_forge = true;
         st.network = Some(state::NetworkState {
             name: "test-net".to_owned(),
             phase: NetworkPhase::Active,
@@ -822,5 +858,48 @@ spec:
             text.contains("would remove network"),
             "should report would remove network: {text}"
         );
+    }
+
+    #[test]
+    fn forced_down_preserves_reused_network() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_state_with_network(directory.path());
+        let mut state = state::load(directory.path())?;
+        state.network_created_by_forge = false;
+        state::save(directory.path(), &state)?;
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond("docker network inspect test-net", ok());
+        let output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(
+            !runner.was_called("network rm"),
+            "force suppresses confirmation without granting ownership"
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("preserved pre-existing network"),
+            "preservation must be explicit"
+        );
+        let retained = state::load(directory.path())?;
+        assert_eq!(
+            retained.network.as_ref().map(|net| &net.phase),
+            Some(&NetworkPhase::Active),
+            "retained network stays active"
+        );
+        Ok(())
+    }
+    /// Run forced teardown with explicit runtime responses and persisted state.
+    fn run_forced_network_teardown(runner: &MockRunner, directory: &std::path::Path) -> Result<Vec<u8>, ForgeError> {
+        let config = test_config();
+        let context = ForgeContext {
+            runner,
+            config: &config,
+            state_dir: directory.to_path_buf(),
+            config_dir: directory.to_path_buf(),
+            format: OutputFormat::Text,
+            dry_run: false,
+        };
+        let mut output = Vec::new();
+        run(&context, true, &mut output)?;
+        Ok(output)
     }
 }

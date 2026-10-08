@@ -44,8 +44,8 @@ pub fn network_name(env_name: &str) -> String {
 
 /// Create a container network with ownership labels.
 ///
-/// Idempotent: returns `Ok(())` if the network already exists
-/// and is owned by this environment.
+/// Returns `true` only when this call creates the network. An existing
+/// network must have matching ownership labels and returns `false`.
 ///
 /// # Errors
 ///
@@ -56,13 +56,15 @@ pub fn create_network(
     binary: &str,
     net_name: &str,
     env_name: &str,
-) -> Result<(), ForgeError> {
+) -> Result<bool, ForgeError> {
     if network_exists(runner, binary, net_name)? {
-        return verify_ownership(runner, binary, net_name, env_name);
+        verify_ownership(runner, binary, net_name, env_name)?;
+        return Ok(false);
     }
     let spec = create_spec(binary, net_name, env_name);
     let output = runner.run(&spec)?;
-    check_success(&output, "network create")
+    check_success(&output, "network create")?;
+    Ok(true)
 }
 
 /// Remove a container network after verifying ownership.
@@ -266,7 +268,7 @@ fn cidr_spec(binary: &str, net_name: &str) -> CommandSpec {
             "inspect".into(),
             net_name.into(),
             "--format".into(),
-            "{{json .IPAM.Config}}".into(),
+            "{{json .}}".into(),
         ],
         env: BTreeMap::default(),
         stdin: None,
@@ -292,17 +294,28 @@ fn parse_labels(stdout: &str) -> Result<BTreeMap<String, String>, ForgeError> {
     serde_json::from_str(trimmed).map_err(|err| ForgeError::State(format!("cannot parse network labels: {err}")))
 }
 
-/// Parse and validate the first IPv4 subnet in a formatted IPAM config.
+/// Parse and validate the first IPv4 subnet in `network inspect` JSON.
 fn parse_ipam_config(stdout: &str) -> Result<String, ForgeError> {
-    let config: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
+    let network: serde_json::Value = serde_json::from_str(stdout.trim())
         .map_err(|err| ForgeError::State(format!("cannot parse network IPAM config: {err}")))?;
-    let subnet = config
-        .first()
-        .and_then(|entry| entry.get("Subnet"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ForgeError::State("network IPAM config has no subnet".to_owned()))?;
+    let subnet = first_ipv4_subnet(&network)
+        .ok_or_else(|| ForgeError::State("network IPAM config has no IPv4 subnet".to_owned()))?;
     validate_ipv4_cidr(subnet)?;
     Ok(subnet.to_owned())
+}
+
+/// First IPv4 subnet of an inspected network, in Docker (`IPAM.Config[].Subnet`) or Podman (`subnets[].subnet`) shape.
+pub(crate) fn first_ipv4_subnet(network: &serde_json::Value) -> Option<&str> {
+    let network = network.as_array().and_then(|all| all.first()).unwrap_or(network);
+    let docker = network.pointer("/IPAM/Config").and_then(serde_json::Value::as_array);
+    let podman = network.get("subnets").and_then(serde_json::Value::as_array);
+    docker
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("Subnet"))
+        .chain(podman.into_iter().flatten().filter_map(|entry| entry.get("subnet")))
+        .filter_map(serde_json::Value::as_str)
+        .find(|subnet| !subnet.contains(':'))
 }
 
 /// Validate an IPv4 CIDR without accepting host-only or IPv6 forms.
@@ -380,7 +393,7 @@ mod tests {
     fn ipam_config(cidr: &str) -> CommandOutput {
         CommandOutput {
             status: 0,
-            stdout: format!(r#"[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]"#),
+            stdout: format!(r#"{{"IPAM":{{"Config":[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]}}}}"#),
             stderr: String::new(),
         }
     }
@@ -599,7 +612,7 @@ mod tests {
     fn inspect_network_cidr_reads_formatted_ipam_config() {
         let mut runner = MockRunner::new();
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            "docker network inspect test-net --format {{json .}}",
             ipam_config("172.18.0.0/16"),
         );
 
@@ -611,7 +624,7 @@ mod tests {
     fn inspect_network_cidr_rejects_invalid_subnet() {
         let mut runner = MockRunner::new();
         runner.respond(
-            "docker network inspect test-net --format {{json .IPAM.Config}}",
+            "docker network inspect test-net --format {{json .}}",
             ipam_config("fd00::/64"),
         );
 
@@ -700,5 +713,21 @@ mod tests {
 
         create_network(&runner, "podman", "test-net", "test").unwrap_or_else(|_| std::process::abort());
         assert!(runner.was_called("podman"), "should use podman binary");
+    }
+
+    #[test]
+    fn network_cidr_accepts_docker_and_podman_ipv6_first_results() -> Result<(), ForgeError> {
+        for json in [
+            r#"{"IPAM":{"Config":[{"Subnet":"fd00::/64"},{"Subnet":"172.18.0.0/16"}]}}"#,
+            r#"{"subnets":[{"subnet":"fd00::/64"},{"subnet":"172.18.0.0/16"}]}"#,
+            r#"[{"subnets":[{"subnet":"fd00::/64"},{"subnet":"172.18.0.0/16"}]}]"#,
+        ] {
+            assert_eq!(
+                parse_ipam_config(json)?,
+                "172.18.0.0/16",
+                "IPv4 allocator must skip preceding IPv6 for both runtimes"
+            );
+        }
+        Ok(())
     }
 }
