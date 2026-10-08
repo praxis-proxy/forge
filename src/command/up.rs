@@ -73,13 +73,8 @@ fn ensure_network(
             dry_run: true,
         }));
     }
-    let owned = state.network_created_by_forge
-        && state
-            .network
-            .as_ref()
-            .is_some_and(|net| net.name == net_name && net.phase != NetworkPhase::Gone);
     let created = networking::create_network(ctx.runner, binary, &net_name, env_name)?;
-    state.network_created_by_forge = owned || created;
+    record_network_ownership(ctx, binary, state, &net_name, created)?;
     // The network exists from here on. inspect_network_cidr can still fail, and
     // until the network is in state `down` has no way to remove it.
     set_network_created(state, &net_name);
@@ -89,6 +84,33 @@ fn ensure_network(
         name: net_name,
         dry_run: false,
     }))
+}
+
+/// Retain creation authority only for the exact runtime instance we recorded.
+fn record_network_ownership(
+    ctx: &ForgeContext<'_>,
+    binary: &str,
+    state: &mut state::ForgeState,
+    name: &str,
+    created: Option<String>,
+) -> Result<(), ForgeError> {
+    let recorded = state.network_created_by_forge
+        && state.network_id.is_some()
+        && state
+            .network
+            .as_ref()
+            .is_some_and(|net| net.name == name && net.phase != NetworkPhase::Gone);
+    let id = if created.is_some() {
+        created
+    } else if recorded {
+        let current = networking::inspect_network_id(ctx.runner, binary, name)?;
+        state.network_id.as_ref().filter(|saved| **saved == current).cloned()
+    } else {
+        None
+    };
+    state.network_created_by_forge = id.is_some();
+    state.network_id = id;
+    Ok(())
 }
 
 /// Check if the config requests cross-cluster networking.
@@ -1156,11 +1178,23 @@ spec:
         }
     }
 
+    /// Runtime identity returned by a successful creation.
+    fn created_network() -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: "a".repeat(64),
+            stderr: String::new(),
+        }
+    }
+
     /// Formatted Docker IPAM response for the test network.
     fn network_cidr(cidr: &str) -> CommandOutput {
         CommandOutput {
             status: 0,
-            stdout: format!(r#"{{"IPAM":{{"Config":[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]}}}}"#),
+            stdout: format!(
+                r#"{{"Id":"{}","IPAM":{{"Config":[{{"Subnet":"{cidr}","Gateway":"172.18.0.1"}}]}}}}"#,
+                "a".repeat(64)
+            ),
             stderr: String::new(),
         }
     }
@@ -1172,6 +1206,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond("docker network create", created_network());
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
@@ -1213,6 +1248,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond("docker network create", created_network());
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
@@ -1267,6 +1303,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond("docker network create", created_network());
         // The network is created, then the CIDR inspect fails. The network is
         // live either way, so it has to be recorded for `down` to remove it.
         runner.respond(
@@ -1452,6 +1489,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond("docker network create", created_network());
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
@@ -1506,6 +1544,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond("docker network create", created_network());
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
@@ -1671,6 +1710,7 @@ spec:
     fn network_setup_runner(exists: bool) -> MockRunner {
         let mut runner = MockRunner::new();
         runner.respond("docker", empty_ok());
+        runner.respond("docker network create", created_network());
         runner.respond(
             "docker network inspect test-net",
             if exists { empty_ok() } else { net_not_found() },
@@ -1703,6 +1743,39 @@ spec:
             dry_run: false,
         };
         ensure_network(&context, "docker", state)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replaced_network_does_not_inherit_recorded_creation() -> Result<(), ForgeError> {
+        let runner = network_setup_runner(true);
+        let mut state = state::empty();
+        set_network_created(&mut state, "test-net");
+        state.network_created_by_forge = true;
+        state.network_id = Some("b".repeat(64));
+        run_network_setup(&runner, &mut state)?;
+        assert!(
+            !state.network_created_by_forge,
+            "same-name replacement does not inherit ownership"
+        );
+        assert!(
+            state.network_id.is_none(),
+            "foreign identity must not become recorded creation authority"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_creation_flag_without_instance_id_does_not_grant_ownership() -> Result<(), ForgeError> {
+        let runner = network_setup_runner(true);
+        let mut state = state::empty();
+        set_network_created(&mut state, "test-net");
+        state.network_created_by_forge = true;
+        run_network_setup(&runner, &mut state)?;
+        assert!(
+            !state.network_created_by_forge,
+            "legacy provenance cannot distinguish replaced instances"
+        );
         Ok(())
     }
 }

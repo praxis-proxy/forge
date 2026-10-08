@@ -250,6 +250,8 @@ enum NetworkAction {
     Remove,
     /// Retain a network whose creation is not owned.
     Preserve,
+    /// The tracked network is already absent.
+    Absent,
 }
 
 /// Remove the environment network if one is tracked in state.
@@ -261,49 +263,52 @@ fn remove_env_network(
         Some(ns) if ns.phase != NetworkPhase::Gone => ns.clone(),
         _ => return Ok(None),
     };
-    if !state.network_created_by_forge {
-        verify_pre_existing_network(ctx, state, &net.name)?;
-        return Ok(Some(NetworkTeardown {
-            name: net.name,
-            dry_run: ctx.dry_run,
-            action: NetworkAction::Preserve,
-        }));
-    }
     if ctx.dry_run {
+        let owned = state.network_created_by_forge && state.network_id.is_some();
+        let action = if owned {
+            NetworkAction::Remove
+        } else {
+            NetworkAction::Preserve
+        };
         return Ok(Some(NetworkTeardown {
             name: net.name,
             dry_run: true,
-            action: NetworkAction::Remove,
+            action,
         }));
     }
-    let binary = resolve_binary(ctx, state)?;
-    let env_name = &ctx.config.metadata.name;
-    networking::remove_network(ctx.runner, &binary, &net.name, env_name)?;
-    mark_network_gone(state);
+    let action = remove_owned_network(ctx, state, &net.name)?;
+    if matches!(action, NetworkAction::Preserve) {
+        state.network_created_by_forge = false;
+        state.network_id = None;
+    } else {
+        mark_network_gone(state);
+    }
     Ok(Some(NetworkTeardown {
         name: net.name,
         dry_run: false,
-        action: NetworkAction::Remove,
+        action,
     }))
 }
 
-/// Verify that a network marked as pre-existing is still present before
-/// reporting that it was preserved.
-fn verify_pre_existing_network(
+/// Compare the live instance with persisted creation authority before deletion.
+fn remove_owned_network(
     ctx: &ForgeContext<'_>,
     state: &state::ForgeState,
     name: &str,
-) -> Result<(), ForgeError> {
-    if ctx.dry_run {
-        return Ok(());
-    }
+) -> Result<NetworkAction, ForgeError> {
     let binary = resolve_binary(ctx, state)?;
-    if networking::network_exists(ctx.runner, &binary, name)? {
-        return Ok(());
+    if !networking::network_exists(ctx.runner, &binary, name)? {
+        return Ok(NetworkAction::Absent);
     }
-    Err(ForgeError::State(format!(
-        "pre-existing network '{name}' is no longer present; refusing to report preservation"
-    )))
+    let Some(recorded) = state.network_id.as_ref().filter(|_| state.network_created_by_forge) else {
+        return Ok(NetworkAction::Preserve);
+    };
+    let current = networking::inspect_network_id(ctx.runner, &binary, name)?;
+    if *recorded != current {
+        return Ok(NetworkAction::Preserve);
+    }
+    networking::remove_network(ctx.runner, &binary, &current, &ctx.config.metadata.name)?;
+    Ok(NetworkAction::Remove)
 }
 
 /// Get the runtime binary from state or by re-detecting.
@@ -318,6 +323,7 @@ fn resolve_binary(ctx: &ForgeContext<'_>, state: &state::ForgeState) -> Result<S
 /// Mark the network as gone in state.
 fn mark_network_gone(state: &mut state::ForgeState) {
     state.network_created_by_forge = false;
+    state.network_id = None;
     if let Some(ref mut ns) = state.network {
         ns.phase = NetworkPhase::Gone;
         ns.cidr = None;
@@ -418,11 +424,15 @@ fn format_net_text(n: &NetworkTeardown) -> String {
         let action = match n.action {
             NetworkAction::Preserve => "preserve pre-existing",
             NetworkAction::Remove => "remove",
+            NetworkAction::Absent => "observe absence of",
         };
         return format!("would {action} network '{}'", n.name);
     }
     if matches!(n.action, NetworkAction::Remove) {
         return format!("removed network '{}'", n.name);
+    }
+    if matches!(n.action, NetworkAction::Absent) {
+        return format!("network '{}' is already absent", n.name);
     }
     format!("preserved pre-existing network '{}'", n.name)
 }
@@ -583,6 +593,7 @@ spec:
             phase: ClusterPhase::Running,
         });
         st.network_created_by_forge = true;
+        st.network_id = Some("a".repeat(64));
         st.network = Some(state::NetworkState {
             name: "test-net".to_owned(),
             phase: NetworkPhase::Active,
@@ -599,6 +610,20 @@ spec:
             stdout: r#"{"forge.managed":"true","forge.environment":"test"}"#.to_owned(),
             stderr: String::new(),
         }
+    }
+
+    /// Respond with a particular runtime network identity.
+    fn respond_network_instance(runner: &mut MockRunner, digit: char) {
+        let id = digit.to_string().repeat(64);
+        runner.respond(
+            "docker network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: format!(r#"{{"Id":"{id}"}}"#),
+                stderr: String::new(),
+            },
+        );
+        runner.respond(&format!("docker network inspect {id}"), ok());
     }
 
     /// Successful empty output.
@@ -630,11 +655,15 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'a');
         runner.respond(
-            "docker network inspect test-net --format {{json .Labels}}",
+            &format!(
+                "docker network inspect {} --format {{{{json .Labels}}}}",
+                "a".repeat(64)
+            ),
             owned_labels(),
         );
-        runner.respond("docker network rm test-net", ok());
+        runner.respond(&format!("docker network rm {}", "a".repeat(64)), ok());
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -822,10 +851,14 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'a');
         // The network belongs to another environment, so removal fails
         // after the clusters were already deleted.
         runner.respond(
-            "docker network inspect test-net --format {{json .Labels}}",
+            &format!(
+                "docker network inspect {} --format {{{{json .Labels}}}}",
+                "a".repeat(64)
+            ),
             foreign_labels(),
         );
         let ctx = test_ctx(&runner, &config, &dir);
@@ -882,6 +915,7 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'a');
         let output = run_forced_network_teardown(&runner, directory.path())?;
         assert!(
             !runner.was_called("network rm"),
@@ -927,5 +961,66 @@ spec:
             "would preserve pre-existing network 'reused-net'",
             "dry-run output must not imply observed preservation"
         );
+    }
+
+    #[test]
+    fn down_preserves_replaced_network_instance() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_state_with_network(directory.path());
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond("docker network inspect test-net", ok());
+        respond_network_instance(&mut runner, 'b');
+        let _output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(
+            !runner.was_called("network rm"),
+            "matching names cannot authorize deleting replacement networks"
+        );
+        let state = state::load(directory.path())?;
+        assert!(!state.network_created_by_forge, "replacement revokes stale ownership");
+        assert!(state.network_id.is_none(), "replacement must not transfer its identity");
+        assert!(
+            state.clusters.iter().all(|cluster| cluster.phase == ClusterPhase::Gone),
+            "cluster cleanup still completes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn down_preserves_legacy_network_without_instance_id() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_state_with_network(directory.path());
+        let mut state = state::load(directory.path())?;
+        state.network_id = None;
+        state::save(directory.path(), &state)?;
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond("docker network inspect test-net", ok());
+        let _output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(
+            !runner.was_called("network rm"),
+            "legacy true flag cannot distinguish runtime instances"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn down_accepts_an_already_absent_owned_network() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        seed_state_with_network(directory.path());
+        let mut runner = MockRunner::new();
+        runner.respond("kind", ok());
+        runner.respond(
+            "docker network inspect test-net",
+            CommandOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "Error: No such network: test-net".to_owned(),
+            },
+        );
+        let _output = run_forced_network_teardown(&runner, directory.path())?;
+        assert!(!runner.was_called("network rm"), "absent networks require no deletion");
+        assert_network_allocation_cleared(directory.path());
+        Ok(())
     }
 }

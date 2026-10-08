@@ -147,6 +147,14 @@ State writes are **atomic** (write-tmp, fsync, rename) and protected by an
 Kubeconfig files are exported to `<state-dir>/runtime/kubeconfig/<cluster>/config`
 with loopback addresses rewritten to container-reachable DNS names.
 
+Networks are deleted only when the saved creation flag and runtime network ID
+identify the current instance, and its Forge environment labels still match.
+Networks created by older Grid/Forge versions have no saved runtime ID; upgrading
+preserves those networks even when the legacy creation flag is true. Cluster
+cleanup still completes. Review any retained network and remove it explicitly
+only after verifying that it is no longer used; do not populate a missing ID
+from a same-name network to manufacture ownership.
+
 ## Cleanup behavior
 
 `praxis-forge down` tears down in reverse order: services, clusters, network.

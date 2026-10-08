@@ -44,8 +44,8 @@ pub fn network_name(env_name: &str) -> String {
 
 /// Create a container network with ownership labels.
 ///
-/// Returns `true` only when this call creates the network. An existing
-/// network must have matching ownership labels and returns `false`.
+/// Returns the runtime network ID only when this call creates the network.
+/// An existing network must have matching ownership labels and returns `None`.
 ///
 /// # Errors
 ///
@@ -56,15 +56,21 @@ pub fn create_network(
     binary: &str,
     net_name: &str,
     env_name: &str,
-) -> Result<bool, ForgeError> {
+) -> Result<Option<String>, ForgeError> {
     if network_exists(runner, binary, net_name)? {
         verify_ownership(runner, binary, net_name, env_name)?;
-        return Ok(false);
+        return Ok(None);
     }
     let spec = create_spec(binary, net_name, env_name);
     let output = runner.run(&spec)?;
     check_success(&output, "network create")?;
-    Ok(true)
+    if std::path::Path::new(binary)
+        .file_name()
+        .is_some_and(|name| name == "podman")
+    {
+        return inspect_network_id(runner, binary, net_name).map(Some);
+    }
+    validate_network_id(output.stdout.trim()).map(|id| Some(id.to_owned()))
 }
 
 /// Remove a container network after verifying ownership.
@@ -146,6 +152,36 @@ pub fn inspect_network_cidr(runner: &dyn CommandRunner, binary: &str, net_name: 
     let output = runner.run(&spec)?;
     check_success(&output, "network inspect")?;
     parse_ipam_config(&output.stdout)
+}
+
+/// Inspect the immutable runtime identity of a named network.
+///
+/// # Errors
+///
+/// Returns [`ForgeError`] if inspection fails or contains no full network ID.
+pub fn inspect_network_id(runner: &dyn CommandRunner, binary: &str, name: &str) -> Result<String, ForgeError> {
+    let output = runner.run(&cidr_spec(binary, name))?;
+    check_success(&output, "network inspect")?;
+    let value: serde_json::Value = serde_json::from_str(&output.stdout)
+        .map_err(|error| ForgeError::State(format!("cannot parse network identity: {error}")))?;
+    let object = value.get(0).unwrap_or(&value);
+    let id = object
+        .get("Id")
+        .or_else(|| object.get("ID"))
+        .or_else(|| object.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ForgeError::State("network inspect omitted its runtime ID".to_owned()))?;
+    validate_network_id(id).map(ToOwned::to_owned)
+}
+
+/// Accept only the full hexadecimal runtime ID, never a reusable network name.
+fn validate_network_id(id: &str) -> Result<&str, ForgeError> {
+    if id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(id);
+    }
+    Err(ForgeError::State(
+        "network runtime ID must contain 64 hexadecimal characters".to_owned(),
+    ))
 }
 
 // ---------------------------------------------------------------
@@ -409,8 +445,16 @@ mod tests {
         let mut runner = MockRunner::new();
         runner.respond("docker network inspect test-net", not_found());
         runner.respond("docker", ok());
+        runner.respond(
+            "docker network create",
+            CommandOutput {
+                status: 0,
+                stdout: "a".repeat(64),
+                stderr: String::new(),
+            },
+        );
 
-        create_network(&runner, "docker", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        let _created = create_network(&runner, "docker", "test-net", "test").unwrap_or_else(|_| std::process::abort());
         assert!(runner.was_called("network create"), "should call network create");
         assert!(runner.was_called("forge.managed=true"), "should include managed label");
         assert!(runner.was_called("forge.environment=test"), "should include env label");
@@ -425,7 +469,7 @@ mod tests {
             owned_labels("test"),
         );
 
-        create_network(&runner, "docker", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        let _created = create_network(&runner, "docker", "test-net", "test").unwrap_or_else(|_| std::process::abort());
         assert!(
             !runner.was_called("network create"),
             "should not create existing network"
@@ -711,7 +755,15 @@ mod tests {
         runner.respond("podman network inspect test-net", not_found());
         runner.respond("podman", ok());
 
-        create_network(&runner, "podman", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        runner.respond(
+            "podman network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: format!(r#"{{"id":"{}"}}"#, "a".repeat(64)),
+                stderr: String::new(),
+            },
+        );
+        let _created = create_network(&runner, "podman", "test-net", "test").unwrap_or_else(|_| std::process::abort());
         assert!(runner.was_called("podman"), "should use podman binary");
     }
 
@@ -728,6 +780,32 @@ mod tests {
                 "IPv4 allocator must skip preceding IPv6 for both runtimes"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn network_identity_accepts_runtime_inspect_shapes() -> Result<(), ForgeError> {
+        let id = "a".repeat(64);
+        for json in [
+            format!(r#"{{"Id":"{id}"}}"#),
+            format!(r#"{{"id":"{id}"}}"#),
+            format!(r#"[{{"ID":"{id}"}}]"#),
+        ] {
+            let mut runner = MockRunner::new();
+            runner.respond(
+                "docker",
+                CommandOutput {
+                    status: 0,
+                    stdout: json,
+                    stderr: String::new(),
+                },
+            );
+            assert_eq!(inspect_network_id(&runner, "docker", "test-net")?, id);
+        }
+        assert!(
+            validate_network_id("test-net").is_err(),
+            "a reusable name is not an identity"
+        );
         Ok(())
     }
 }

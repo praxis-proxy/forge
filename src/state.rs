@@ -61,6 +61,10 @@ pub struct ForgeState {
     /// Missing historical provenance never authorizes network removal.
     #[serde(default)]
     pub network_created_by_forge: bool,
+    /// Runtime identity returned when the tracked network was created.
+    /// Legacy state without this identity never authorizes network deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
     /// Detected container runtime name, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
@@ -253,6 +257,7 @@ pub fn empty() -> ForgeState {
         stacks: Vec::new(),
         network: None,
         network_created_by_forge: false,
+        network_id: None,
         runtime: None,
         config_digest: None,
         last_operation: None,
