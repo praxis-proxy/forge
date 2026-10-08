@@ -73,7 +73,9 @@ fn ensure_network(
             dry_run: true,
         }));
     }
-    let created = networking::create_network(ctx.runner, binary, &net_name, env_name)?;
+    prepare_network_creation(ctx, binary, state, &net_name)?;
+    let token = state.network_creation_token.as_deref().unwrap_or("");
+    let created = networking::create_network(ctx.runner, binary, &net_name, env_name, token)?;
     record_network_ownership(ctx, binary, state, &net_name, created)?;
     // The network exists from here on. inspect_network_cidr can still fail, and
     // until the network is in state `down` has no way to remove it.
@@ -86,6 +88,23 @@ fn ensure_network(
     }))
 }
 
+/// Checkpoint a correlation token before a network can be created externally.
+fn prepare_network_creation(
+    ctx: &ForgeContext<'_>,
+    binary: &str,
+    state: &mut state::ForgeState,
+    name: &str,
+) -> Result<(), ForgeError> {
+    if networking::network_exists(ctx.runner, binary, name)? {
+        return Ok(());
+    }
+    state.network_created_by_forge = false;
+    state.network_id = None;
+    state.network_creation_token = Some(networking::creation_token());
+    set_network_created(state, name);
+    checkpoint(ctx, state)
+}
+
 /// Retain creation authority only for the exact runtime instance we recorded.
 fn record_network_ownership(
     ctx: &ForgeContext<'_>,
@@ -94,23 +113,38 @@ fn record_network_ownership(
     name: &str,
     created: Option<String>,
 ) -> Result<(), ForgeError> {
-    let recorded = state.network_created_by_forge
-        && state.network_id.is_some()
-        && state
-            .network
-            .as_ref()
-            .is_some_and(|net| net.name == name && net.phase != NetworkPhase::Gone);
+    let tracked = state
+        .network
+        .as_ref()
+        .is_some_and(|net| net.name == name && net.phase != NetworkPhase::Gone);
     let id = if created.is_some() {
         created
-    } else if recorded {
-        let current = networking::inspect_network_id(ctx.runner, binary, name)?;
-        state.network_id.as_ref().filter(|saved| **saved == current).cloned()
+    } else if tracked {
+        retained_network_id(ctx, binary, state, name)?
     } else {
         None
     };
     state.network_created_by_forge = id.is_some();
     state.network_id = id;
+    state.network_creation_token = None;
     Ok(())
+}
+
+/// Reconcile an established identity or an interrupted attempt with the runtime.
+fn retained_network_id(
+    ctx: &ForgeContext<'_>,
+    binary: &str,
+    state: &state::ForgeState,
+    name: &str,
+) -> Result<Option<String>, ForgeError> {
+    if let Some(saved) = state.network_id.as_ref().filter(|_| state.network_created_by_forge) {
+        let current = networking::inspect_network_id(ctx.runner, binary, name)?;
+        return Ok((saved == &current).then(|| saved.clone()));
+    }
+    if let Some(token) = state.network_creation_token.as_deref() {
+        return networking::recover_network_id(ctx.runner, binary, name, &ctx.config.metadata.name, token);
+    }
+    Ok(None)
 }
 
 /// Check if the config requests cross-cluster networking.
@@ -1187,12 +1221,9 @@ spec:
         }
     }
 
-    /// Register the full creation command used by the exact-match mock runner.
+    /// Supply a valid creation identity after more specific inspection responses.
     fn respond_created_network(runner: &mut MockRunner) {
-        runner.respond(
-            "docker network create --label forge.managed=true --label forge.environment=test test-net",
-            created_network(),
-        );
+        runner.respond("docker", created_network());
     }
 
     /// Formatted Docker IPAM response for the test network.
@@ -1214,12 +1245,11 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
         );
-        runner.respond("docker", empty_ok());
+        respond_created_network(&mut runner);
         runner.respond("kind get clusters", empty_ok());
         runner.respond("kind", empty_ok());
         let ctx = ForgeContext {
@@ -1256,12 +1286,11 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
         );
-        runner.respond("docker", empty_ok());
+        respond_created_network(&mut runner);
         runner.respond("kind get clusters", kind_list_failed());
         let ctx = ForgeContext {
             runner: &runner,
@@ -1311,7 +1340,6 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        respond_created_network(&mut runner);
         // The network is created, then the CIDR inspect fails. The network is
         // live either way, so it has to be recorded for `down` to remove it.
         runner.respond(
@@ -1322,7 +1350,7 @@ spec:
                 stderr: "inspect blew up\n".to_owned(),
             },
         );
-        runner.respond("docker", empty_ok());
+        respond_created_network(&mut runner);
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -1497,12 +1525,11 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
         );
-        runner.respond("docker", empty_ok());
+        respond_created_network(&mut runner);
         runner.respond("kind get clusters", empty_ok());
         runner.respond("kind", empty_ok());
         let ctx = ForgeContext {
@@ -1552,12 +1579,11 @@ spec:
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_ok());
         runner.respond("docker network inspect test-net", net_not_found());
-        respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
             network_cidr("172.18.0.0/16"),
         );
-        runner.respond("docker", empty_ok());
+        respond_created_network(&mut runner);
         runner.respond("kind get clusters", empty_ok());
         runner.respond("kind", empty_ok());
         let ctx = ForgeContext {
@@ -1717,7 +1743,6 @@ spec:
     /// Create deterministic network responses for ownership histories.
     fn network_setup_runner(exists: bool) -> MockRunner {
         let mut runner = MockRunner::new();
-        runner.respond("docker", empty_ok());
         respond_created_network(&mut runner);
         runner.respond(
             "docker network inspect test-net",
@@ -1741,12 +1766,21 @@ spec:
     /// Execute the network phase while keeping state across invocations.
     fn run_network_setup(runner: &MockRunner, state: &mut state::ForgeState) -> Result<(), ForgeError> {
         let directory = test_dir();
+        run_network_setup_at(runner, state, directory.path())
+    }
+
+    /// Execute network setup in a directory whose checkpoint can be reloaded.
+    fn run_network_setup_at(
+        runner: &MockRunner,
+        state: &mut state::ForgeState,
+        directory: &std::path::Path,
+    ) -> Result<(), ForgeError> {
         let config = test_config_with_network();
         let context = ForgeContext {
             runner,
             config: &config,
-            state_dir: directory.path().to_path_buf(),
-            config_dir: directory.path().to_path_buf(),
+            state_dir: directory.to_path_buf(),
+            config_dir: directory.to_path_buf(),
             format: OutputFormat::Text,
             dry_run: false,
         };
@@ -1785,5 +1819,72 @@ spec:
             "legacy provenance cannot distinguish replaced instances"
         );
         Ok(())
+    }
+
+    #[test]
+    fn failed_identity_lookup_can_resume_its_creation_attempt() -> Result<(), ForgeError> {
+        let directory = test_dir();
+        let mut runner = network_setup_runner(false);
+        runner.respond("docker", empty_ok());
+        let mut pending = state::empty();
+        let failure = run_network_setup_at(&runner, &mut pending, directory.path());
+        assert!(
+            matches!(failure, Err(ForgeError::State(_))),
+            "invalid creation ID must fail"
+        );
+        let mut restored = state::load(directory.path())?;
+        let token = restored
+            .network_creation_token
+            .clone()
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            runner.was_called(&format!("forge.creation={token}")),
+            "checkpoint must match creation label"
+        );
+        let mut resumed = network_setup_runner(true);
+        respond_attempt_identity(&mut resumed, &token);
+        run_network_setup(&resumed, &mut restored)?;
+        assert!(restored.network_created_by_forge, "matching attempt recovers ownership");
+        assert_eq!(
+            restored.network_id,
+            Some("a".repeat(64)),
+            "recovery binds runtime instance"
+        );
+        assert!(restored.network_creation_token.is_none(), "attempt completed");
+        Ok(())
+    }
+
+    #[test]
+    fn pending_creation_does_not_adopt_a_replacement() -> Result<(), ForgeError> {
+        let mut state = state::empty();
+        set_network_created(&mut state, "test-net");
+        state.network_creation_token = Some("original-attempt".to_owned());
+        let mut runner = network_setup_runner(true);
+        respond_attempt_identity(&mut runner, "another-attempt");
+        run_network_setup(&runner, &mut state)?;
+        assert!(
+            !state.network_created_by_forge,
+            "same environment cannot transfer an attempt"
+        );
+        assert!(state.network_id.is_none(), "replacement remains unowned");
+        assert!(state.network_creation_token.is_none(), "stale attempt is discarded");
+        Ok(())
+    }
+
+    /// Respond with a network created by a specific checkpointed attempt.
+    fn respond_attempt_identity(runner: &mut MockRunner, token: &str) {
+        runner.respond(
+            "docker network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: serde_json::json!({
+                    "Id": "a".repeat(64),
+                    "IPAM": {"Config": [{"Subnet": "172.18.0.0/16"}]},
+                    "Labels": {"forge.managed": "true", "forge.environment": "test", "forge.creation": token}
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        );
     }
 }

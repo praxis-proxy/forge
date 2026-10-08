@@ -65,6 +65,10 @@ pub struct ForgeState {
     /// Legacy state without this identity never authorizes network deletion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_id: Option<String>,
+    /// Correlation label persisted before a network creation attempt.
+    /// It permits interrupted identity lookup to recover only that attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_creation_token: Option<String>,
     /// Detected container runtime name, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
@@ -258,6 +262,7 @@ pub fn empty() -> ForgeState {
         network: None,
         network_created_by_forge: false,
         network_id: None,
+        network_creation_token: None,
         runtime: None,
         config_digest: None,
         last_operation: None,
