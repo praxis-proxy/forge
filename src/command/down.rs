@@ -240,8 +240,16 @@ struct NetworkTeardown {
     name: String,
     /// Whether this was a dry-run skip.
     dry_run: bool,
-    /// Whether the network was removed by this operation.
-    removed: bool,
+    /// Intended network disposition.
+    action: NetworkAction,
+}
+
+/// Network disposition after teardown.
+enum NetworkAction {
+    /// Delete a network owned by the active lifecycle.
+    Remove,
+    /// Retain a network whose creation is not owned.
+    Preserve,
 }
 
 /// Remove the environment network if one is tracked in state.
@@ -257,15 +265,15 @@ fn remove_env_network(
         verify_pre_existing_network(ctx, state, &net.name)?;
         return Ok(Some(NetworkTeardown {
             name: net.name,
-            dry_run: false,
-            removed: false,
+            dry_run: ctx.dry_run,
+            action: NetworkAction::Preserve,
         }));
     }
     if ctx.dry_run {
         return Ok(Some(NetworkTeardown {
             name: net.name,
             dry_run: true,
-            removed: false,
+            action: NetworkAction::Remove,
         }));
     }
     let binary = resolve_binary(ctx, state)?;
@@ -275,7 +283,7 @@ fn remove_env_network(
     Ok(Some(NetworkTeardown {
         name: net.name,
         dry_run: false,
-        removed: true,
+        action: NetworkAction::Remove,
     }))
 }
 
@@ -351,7 +359,7 @@ fn render_json(
     if let (Some(nd), Some(obj)) = (net, data.as_object_mut()) {
         obj.insert(
             "network".to_owned(),
-            serde_json::json!({ "name": nd.name, "dryRun": nd.dry_run, "removed": nd.removed }),
+            serde_json::json!({ "name": nd.name, "dryRun": nd.dry_run, "removed": !nd.dry_run && matches!(nd.action, NetworkAction::Remove) }),
         );
     }
     let envelope = output::success(data);
@@ -407,9 +415,13 @@ fn format_svc_text(svc: &SvcDeleteResult) -> String {
 /// Format a network teardown result as a text line.
 fn format_net_text(n: &NetworkTeardown) -> String {
     if n.dry_run {
-        return format!("would remove network '{}'", n.name);
+        let action = match n.action {
+            NetworkAction::Preserve => "preserve pre-existing",
+            NetworkAction::Remove => "remove",
+        };
+        return format!("would {action} network '{}'", n.name);
     }
-    if n.removed {
+    if matches!(n.action, NetworkAction::Remove) {
         return format!("removed network '{}'", n.name);
     }
     format!("preserved pre-existing network '{}'", n.name)
@@ -901,5 +913,19 @@ spec:
         let mut output = Vec::new();
         run(&context, true, &mut output)?;
         Ok(output)
+    }
+
+    #[test]
+    fn dry_run_reports_prospective_network_preservation() {
+        let teardown = NetworkTeardown {
+            name: "reused-net".to_owned(),
+            dry_run: true,
+            action: NetworkAction::Preserve,
+        };
+        assert_eq!(
+            format_net_text(&teardown),
+            "would preserve pre-existing network 'reused-net'",
+            "dry-run output must not imply observed preservation"
+        );
     }
 }
