@@ -6,7 +6,15 @@
 
 use std::path::PathBuf;
 
-use crate::{command::runner::CommandRunner, config::ForgeConfig, output::OutputFormat};
+use crate::{
+    cluster::kind::{self, KindProvider},
+    command::runner::CommandRunner,
+    config::ForgeConfig,
+    error::ForgeError,
+    output::OutputFormat,
+    runtime,
+    state::ForgeState,
+};
 
 /// Shared execution context for a single command invocation.
 ///
@@ -26,4 +34,17 @@ pub struct ForgeContext<'env> {
     pub format: OutputFormat,
     /// If true, skip all mutating operations.
     pub dry_run: bool,
+}
+
+impl ForgeContext<'_> {
+    /// The provider kind must use: from the runtime recorded in state, else a fresh resolve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError`] if the runtime cannot be resolved or detected.
+    pub fn kind_provider(&self, st: &ForgeState) -> Result<KindProvider, ForgeError> {
+        let binary =
+            runtime::recorded_or_resolved(self.runner, &self.config.spec.runtime.provider, st.runtime.as_deref())?;
+        kind::provider_for(self.runner, &binary)
+    }
 }

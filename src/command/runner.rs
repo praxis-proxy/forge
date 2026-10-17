@@ -355,6 +355,24 @@ impl MockRunner {
         }
     }
 
+    /// Create a mock runner on which the given runtime resolves and kind detects it.
+    pub fn with_runtime(program: &str) -> Self {
+        let version = if program == "docker" {
+            "Docker version 27.3.1, build ce12230\n"
+        } else {
+            "podman version 5.6.1\n"
+        };
+        let ok = |stdout: &str| CommandOutput {
+            status: 0,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        };
+        let mut runner = Self::new();
+        runner.respond(&format!("{program} version"), ok(version));
+        runner.respond(&format!("{program} -v"), ok(version));
+        runner
+    }
+
     /// Register a canned response for a display string or program.
     pub fn respond(&mut self, program: &str, output: CommandOutput) -> &mut Self {
         self.responses.insert(program.to_owned(), output);
