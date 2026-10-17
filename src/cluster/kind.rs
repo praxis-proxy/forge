@@ -12,6 +12,9 @@ use crate::{
     error::ForgeError,
 };
 
+/// Per-provider variables kind reads to override the node network.
+const NETWORK_ENV_KEYS: &[&str] = &["KIND_EXPERIMENTAL_DOCKER_NETWORK", "KIND_EXPERIMENTAL_PODMAN_NETWORK"];
+
 // ---------------------------------------------------------------
 // Naming
 // ---------------------------------------------------------------
@@ -48,14 +51,13 @@ pub struct CreateClusterConfig<'cfg> {
     pub ports: &'cfg [PortMapping],
     /// Directory where config files are written.
     pub config_dir: &'cfg std::path::Path,
-    /// Optional Docker network to join via `KIND_EXPERIMENTAL_DOCKER_NETWORK`.
-    pub docker_network: Option<&'cfg str>,
+    /// Optional container network for the nodes to join.
+    pub kind_network: Option<&'cfg str>,
 }
 
 /// Create a KIND cluster with a generated config.
 ///
-/// When `docker_network` is `Some`, the cluster nodes join that
-/// Docker network via `KIND_EXPERIMENTAL_DOCKER_NETWORK`.
+/// When `kind_network` is `Some`, the cluster nodes join that network.
 ///
 /// # Errors
 ///
@@ -67,7 +69,7 @@ pub fn create_cluster(
 ) -> Result<(), ForgeError> {
     let config_yaml = generate_kind_config(config.nodes, config.ports);
     let config_path = write_kind_config(config.config_dir, kind_name, &config_yaml)?;
-    let result = run_create(runner, kind_name, &config_path, config.docker_network);
+    let result = run_create(runner, kind_name, &config_path, config.kind_network);
     cleanup_kind_config(&config_path);
     result
 }
@@ -189,9 +191,9 @@ fn run_create(
     runner: &dyn CommandRunner,
     kind_name: &str,
     config_path: &std::path::Path,
-    docker_network: Option<&str>,
+    kind_network: Option<&str>,
 ) -> Result<(), ForgeError> {
-    let spec = create_spec(kind_name, config_path, docker_network);
+    let spec = create_spec(kind_name, config_path, kind_network);
     let output = runner.run(&spec)?;
     check_success(&output, "kind create cluster")
 }
@@ -202,10 +204,15 @@ fn cleanup_kind_config(path: &std::path::Path) {
 }
 
 /// Build a `kind create cluster` command spec.
-fn create_spec(kind_name: &str, config_path: &std::path::Path, docker_network: Option<&str>) -> CommandSpec {
+fn create_spec(kind_name: &str, config_path: &std::path::Path, kind_network: Option<&str>) -> CommandSpec {
     let mut env = BTreeMap::default();
-    if let Some(net) = docker_network {
-        env.insert("KIND_EXPERIMENTAL_DOCKER_NETWORK".into(), net.into());
+    if let Some(net) = kind_network {
+        // kind reads one variable per provider and ignores the other. Forge's
+        // resolved binary does not predict the provider kind detects: the
+        // podman-docker shim is named `docker` and still drives podman.
+        for key in NETWORK_ENV_KEYS {
+            env.insert((*key).into(), net.into());
+        }
     }
     CommandSpec {
         program: "kind".into(),
@@ -427,11 +434,14 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_sets_docker_network_env() {
+    fn create_spec_sets_network_env_for_every_provider() {
         let spec = create_spec("forge-hub", std::path::Path::new("/tmp/cfg.yaml"), Some("test-net"));
-        let key = std::ffi::OsString::from("KIND_EXPERIMENTAL_DOCKER_NETWORK");
         let expected = std::ffi::OsString::from("test-net");
-        assert_eq!(spec.env.get(&key), Some(&expected), "should set network env");
+        for key in NETWORK_ENV_KEYS {
+            let key = std::ffi::OsString::from(*key);
+            assert_eq!(spec.env.get(&key), Some(&expected), "should set {key:?}");
+        }
+        assert_eq!(spec.env.len(), NETWORK_ENV_KEYS.len(), "no other env");
     }
 
     #[test]

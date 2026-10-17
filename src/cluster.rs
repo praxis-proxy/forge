@@ -217,7 +217,7 @@ fn create_if_missing(
         nodes: &cluster.nodes,
         ports: &cluster.ports,
         config_dir: &ctx.state_dir,
-        docker_network: None,
+        kind_network: None,
     };
     kind_ops::create_cluster(ctx.runner, kind_name, &config)?;
     upsert_cluster_state(st, name, kind_name, ClusterPhase::Running);

@@ -92,7 +92,7 @@ spec:
     clusterPrefix: forge    # KIND cluster name prefix
 
   network:
-    crossCluster: false     # enable cross-cluster Docker networking
+    crossCluster: false     # enable cross-cluster container networking
     dnsZone: forge.test     # DNS zone for cross-cluster discovery
 
   clusters:
@@ -189,6 +189,20 @@ over an active environment to make an older binary accept it.
 - Container runtime: Docker or Podman
 - Kubernetes tooling: kind, kubectl, helm (checked by `doctor`)
 - Rust 1.96+ for building from source
+
+### Rootless Podman
+
+kind refuses to create a cluster unless the cgroup it runs in has the cpu,
+cpuset, io, memory and pids controllers delegated, and a desktop session
+usually delegates only memory and pids. Start Forge in its own delegated
+scope:
+
+```console
+systemd-run --scope --user -p Delegate=yes praxis-forge up
+```
+
+`Delegate=yes` in `/etc/systemd/system/user@.service.d/delegate.conf` is a
+prerequisite but not sufficient on its own.
 
 ## How Forge relates to other Praxis repositories
 

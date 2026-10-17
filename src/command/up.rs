@@ -27,9 +27,6 @@ use crate::{
 /// or state persistence fails.
 pub fn run(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), ForgeError> {
     let resolved = runtime::resolve(ctx.runner, &ctx.config.spec.runtime.provider)?;
-    if wants_network(ctx) {
-        networking::require_docker_for_cross_cluster(&resolved.binary)?;
-    }
     let _lock = lock::acquire(&ctx.state_dir)?;
     let mut state = state::load(&ctx.state_dir)?;
     state.runtime = Some(resolved.binary.clone());
@@ -212,17 +209,17 @@ struct ClusterResult {
 
 /// Iterate configured clusters, creating any that are missing.
 fn create_clusters(ctx: &ForgeContext<'_>, state: &mut state::ForgeState) -> Result<Vec<ClusterResult>, ForgeError> {
-    let docker_network = docker_network_for_kind(ctx);
+    let kind_network = kind_network_for_clusters(ctx);
     let mut results = Vec::new();
     for cluster in &ctx.config.spec.clusters {
-        let result = process_cluster(ctx, state, cluster, docker_network.as_deref())?;
+        let result = process_cluster(ctx, state, cluster, kind_network.as_deref())?;
         results.push(result);
     }
     Ok(results)
 }
 
-/// Determine the Docker network name for KIND clusters, if any.
-fn docker_network_for_kind(ctx: &ForgeContext<'_>) -> Option<String> {
+/// Determine the container network name for KIND clusters, if any.
+fn kind_network_for_clusters(ctx: &ForgeContext<'_>) -> Option<String> {
     ctx.config
         .spec
         .network
@@ -236,13 +233,13 @@ fn process_cluster(
     ctx: &ForgeContext<'_>,
     state: &mut state::ForgeState,
     cluster: &ClusterSpec,
-    docker_network: Option<&str>,
+    kind_network: Option<&str>,
 ) -> Result<ClusterResult, ForgeError> {
     let kind_name = kind_ops::kind_cluster_name(&ctx.config.spec.runtime.cluster_prefix, &cluster.name);
     if ctx.dry_run {
         return Ok(dry_run_result(&cluster.name, &kind_name));
     }
-    let created = create_if_missing(ctx, &kind_name, cluster, state, docker_network)?;
+    let created = create_if_missing(ctx, &kind_name, cluster, state, kind_network)?;
     Ok(ClusterResult {
         name: cluster.name.clone(),
         kind_name,
@@ -271,7 +268,7 @@ fn create_if_missing(
     kind_name: &str,
     cluster: &ClusterSpec,
     state: &mut state::ForgeState,
-    docker_network: Option<&str>,
+    kind_network: Option<&str>,
 ) -> Result<bool, ForgeError> {
     if kind_ops::cluster_exists(ctx.runner, kind_name)? {
         ensure_state_entry(state, &cluster.name, kind_name, ClusterPhase::Running);
@@ -283,7 +280,7 @@ fn create_if_missing(
         nodes: &cluster.nodes,
         ports: &cluster.ports,
         config_dir: &ctx.state_dir,
-        docker_network,
+        kind_network,
     };
     kind_ops::create_cluster(ctx.runner, kind_name, &cluster_config)?;
     ensure_state_entry(state, &cluster.name, kind_name, ClusterPhase::Running);
@@ -1548,12 +1545,20 @@ spec:
     }
 
     #[test]
-    fn cross_cluster_auto_resolved_podman_fails() {
+    fn cross_cluster_auto_resolved_podman_passes() {
         let config = test_config_cross_auto();
         let dir = test_dir();
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_not_found());
         runner.respond("podman version", podman_ok());
+        runner.respond("podman network inspect test-net", net_not_found());
+        runner.respond(
+            "podman network inspect test-net --format {{json .}}",
+            network_cidr("10.89.0.0/24"),
+        );
+        runner.respond("podman", created_network());
+        runner.respond("kind get clusters", empty_ok());
+        runner.respond("kind", empty_ok());
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -1562,14 +1567,12 @@ spec:
             format: OutputFormat::Text,
             dry_run: false,
         };
-        let mut buf = Vec::new();
-        let result = run(&ctx, &mut buf);
-        assert!(result.is_err(), "auto+podman+crossCluster should fail");
-        let Err(err) = result else {
-            std::process::abort();
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Docker"), "error should mention Docker: {msg}");
+        let text = run_up(&ctx);
+        assert!(
+            text.contains("network 'test-net' ready"),
+            "auto+podman should succeed: {text}"
+        );
+        assert_kind_create_has_network_env(&runner, "test-net");
     }
 
     #[test]
@@ -1626,15 +1629,17 @@ spec:
 
     // Test Utilities
 
-    /// Verify `kind create` was called with the expected Docker network env.
+    /// Verify `kind create` was called with the expected network env.
     fn assert_kind_create_has_network_env(runner: &MockRunner, expected: &str) {
         let calls = runner.calls();
         let Some(call) = calls.iter().find(|cl| cl.to_string().contains("kind create")) else {
             std::process::abort();
         };
-        let key = std::ffi::OsString::from("KIND_EXPERIMENTAL_DOCKER_NETWORK");
-        let val = call.env.get(&key).map(|os| os.to_string_lossy().into_owned());
-        assert_eq!(val.as_deref(), Some(expected), "kind create should set network env");
+        for key in ["KIND_EXPERIMENTAL_DOCKER_NETWORK", "KIND_EXPERIMENTAL_PODMAN_NETWORK"] {
+            let key = std::ffi::OsString::from(key);
+            let val = call.env.get(&key).map(|os| os.to_string_lossy().into_owned());
+            assert_eq!(val.as_deref(), Some(expected), "kind create should set {key:?}");
+        }
     }
 
     /// Config with `crossCluster: true` and `provider: auto`.

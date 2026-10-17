@@ -12,7 +12,7 @@
 //! - Kind cluster lifecycle (`up`/`down`/`cluster` subcommands)
 //! - Host-level container services (`service start`/`stop`/`logs`)
 //! - Composable deployment stacks (`stack apply`/`plan`/`status`)
-//! - Cross-cluster Docker networking
+//! - Cross-cluster container networking
 //! - Template-based manifest rendering with capture variables
 //! - Persistent state under `.forge/`
 //!
@@ -23,8 +23,9 @@
 //! Certificate generation/distribution and image building are
 //! planned but not yet implemented.
 //!
-//! Cross-cluster networking requires Docker; Podman support is
-//! limited to single-cluster environments.
+//! Cross-cluster networking works on Docker and on Podman. Rootless
+//! Podman additionally needs cgroup delegation for the process tree
+//! that runs `kind`: see `docs/rootless-podman.md`.
 
 pub mod cli;
 pub mod cluster;

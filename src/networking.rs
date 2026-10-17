@@ -18,24 +18,6 @@ use crate::{
 // Naming
 // ---------------------------------------------------------------
 
-/// Verify the resolved runtime supports cross-cluster networking.
-///
-/// `KIND_EXPERIMENTAL_DOCKER_NETWORK` is Docker-only; Podman does not
-/// support it.  Call after `runtime::resolve()` when cross-cluster
-/// networking is configured.
-///
-/// # Errors
-///
-/// Returns [`ForgeError::Config`] if the resolved binary is not Docker.
-pub fn require_docker_for_cross_cluster(binary: &str) -> Result<(), ForgeError> {
-    if binary == "docker" {
-        return Ok(());
-    }
-    Err(ForgeError::Config(format!(
-        "cross-cluster networking requires Docker, but runtime resolved to {binary:?}"
-    )))
-}
-
 /// Build the deterministic network name: `"{env_name}-net"`.
 pub fn network_name(env_name: &str) -> String {
     format!("{env_name}-net")
@@ -75,20 +57,20 @@ pub fn create_network(
     let spec = create_spec(binary, net_name, env_name, creation_token);
     let output = runner.run(&spec)?;
     check_success(&output, "network create")?;
-    if std::path::Path::new(binary)
-        .file_name()
-        .is_some_and(|name| name == "podman")
-    {
-        return recover_network_id(runner, binary, net_name, env_name, creation_token)?.map_or_else(
-            || {
-                Err(ForgeError::State(
-                    "created network was replaced before identity lookup".to_owned(),
-                ))
-            },
-            |id| Ok(Some(id)),
-        );
+    // Docker prints the new network's ID; podman prints its name. Branching on
+    // the binary name misreads the podman-docker shim, which is named `docker`,
+    // so take stdout only when it is an ID and otherwise look the identity up.
+    if let Ok(id) = validate_network_id(output.stdout.trim()) {
+        return Ok(Some(id.to_owned()));
     }
-    validate_network_id(output.stdout.trim()).map(|id| Some(id.to_owned()))
+    recover_network_id(runner, binary, net_name, env_name, creation_token)?.map_or_else(
+        || {
+            Err(ForgeError::State(
+                "created network was replaced before identity lookup".to_owned(),
+            ))
+        },
+        |id| Ok(Some(id)),
+    )
 }
 
 /// Remove a container network after verifying ownership.
@@ -880,6 +862,40 @@ mod tests {
             "a reusable name is not an identity"
         );
         Ok(())
+    }
+
+    #[test]
+    fn creation_recovers_identity_when_the_runtime_prints_a_name() {
+        // The podman-docker shim is named `docker` and prints the network name.
+        let mut runner = MockRunner::new();
+        runner.respond("docker network inspect test-net", not_found());
+        runner.respond(
+            "docker network create --label forge.managed=true --label forge.environment=test --label forge.creation=attempt test-net",
+            CommandOutput {
+                status: 0,
+                stdout: "test-net\n".to_owned(),
+                stderr: String::new(),
+            },
+        );
+        runner.respond(
+            "docker network inspect test-net --format {{json .}}",
+            CommandOutput {
+                status: 0,
+                stdout: serde_json::json!({
+                    "id": "b".repeat(64),
+                    "labels": {"forge.managed": "true", "forge.environment": "test", "forge.creation": "attempt"}
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        );
+        let created =
+            create_network(&runner, "docker", "test-net", "test", "attempt").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            created.as_deref(),
+            Some("b".repeat(64).as_str()),
+            "identity from inspect"
+        );
     }
 
     #[test]

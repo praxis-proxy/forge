@@ -6,9 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
-    config::{
-        API_VERSION, ForgeConfig, HealthCheck, KIND, NetworkMode, PortMapping, RuntimeProvider, ServiceSpec, StepSpec,
-    },
+    config::{API_VERSION, ForgeConfig, HealthCheck, KIND, NetworkMode, PortMapping, ServiceSpec, StepSpec},
     error::ForgeError,
 };
 
@@ -38,7 +36,6 @@ pub fn validate(config: &ForgeConfig) -> Result<(), ForgeError> {
     check_dns_zone(config)?;
     check_coredns_requires_cross_cluster(config)?;
     check_environment_network_requires_cross_cluster(config)?;
-    check_cross_cluster_provider(config)?;
     check_certificates_not_implemented(config)?;
     check_no_templates(config)?;
     Ok(())
@@ -1220,20 +1217,6 @@ fn check_environment_network_requires_cross_cluster(config: &ForgeConfig) -> Res
     Ok(())
 }
 
-/// Cross-cluster networking requires Docker; reject explicit Podman.
-fn check_cross_cluster_provider(config: &ForgeConfig) -> Result<(), ForgeError> {
-    let wants_cross = config.spec.network.as_ref().is_some_and(|n| n.cross_cluster);
-    if !wants_cross {
-        return Ok(());
-    }
-    if config.spec.runtime.provider == RuntimeProvider::Podman {
-        return Err(ForgeError::Validation(
-            "cross-cluster networking requires Docker; Podman is not supported in this phase".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 /// Certificate generation is reserved for a future phase; reject an
 /// enabled setting rather than silently ignoring it.
 ///
@@ -1257,7 +1240,7 @@ mod tests {
     use super::*;
     use crate::config::{
         CertificateConfig, ClusterSpec, EnvironmentSpec, HealthCheckType, Metadata, NetworkConfig, NodeConfig,
-        RestartPolicy, RuntimeConfig, StackSpec, VolumeMount,
+        RestartPolicy, RuntimeConfig, RuntimeProvider, StackSpec, VolumeMount,
     };
 
     /// Build a minimal valid config for test modification.
@@ -2882,7 +2865,7 @@ spec:
     }
 
     #[test]
-    fn cross_cluster_with_podman_rejected() {
+    fn cross_cluster_with_podman_passes() {
         let mut config = base_config();
         config.spec.runtime = RuntimeConfig {
             provider: RuntimeProvider::Podman,
@@ -2892,11 +2875,9 @@ spec:
             cross_cluster: true,
             dns_zone: None,
         });
-        let Err(err) = validate(&config) else {
+        validate(&config).unwrap_or_else(|_e| {
             std::process::abort();
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Podman"), "should mention Podman: {msg}");
+        });
     }
 
     #[test]
