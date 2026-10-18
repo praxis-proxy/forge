@@ -65,9 +65,15 @@ struct DeleteResult {
 /// Delete clusters in reverse order from state.
 fn delete_clusters(ctx: &ForgeContext<'_>, state: &mut state::ForgeState) -> Result<Vec<DeleteResult>, ForgeError> {
     let targets = collect_targets(state);
+    // Resolved once, and never on a dry run, which runs no command.
+    let provider = if ctx.dry_run || targets.is_empty() {
+        None
+    } else {
+        Some(ctx.kind_provider(state)?)
+    };
     let mut results = Vec::new();
     for (name, kind_name) in targets.into_iter().rev() {
-        let result = delete_one(ctx, state, &name, &kind_name)?;
+        let result = delete_one(ctx, state, &name, &kind_name, provider)?;
         results.push(result);
     }
     Ok(results)
@@ -93,17 +99,18 @@ fn delete_one(
     state: &mut state::ForgeState,
     name: &str,
     kind_name: &str,
+    provider: Option<kind_ops::KindProvider>,
 ) -> Result<DeleteResult, ForgeError> {
-    if ctx.dry_run {
+    let Some(provider) = provider else {
         return Ok(DeleteResult {
             name: name.to_owned(),
             kind_name: kind_name.to_owned(),
             dry_run: true,
         });
-    }
+    };
     set_cluster_phase(state, name, ClusterPhase::Deleting);
     checkpoint(ctx, state)?;
-    kind_ops::delete_cluster(ctx.runner, kind_name)?;
+    kind_ops::delete_cluster(ctx.runner, provider, kind_name)?;
     set_cluster_phase(state, name, ClusterPhase::Gone);
     Ok(DeleteResult {
         name: name.to_owned(),
@@ -335,11 +342,7 @@ fn owned_network_id(
 
 /// Get the runtime binary from state or by re-detecting.
 fn resolve_binary(ctx: &ForgeContext<'_>, state: &state::ForgeState) -> Result<String, ForgeError> {
-    if let Some(binary) = &state.runtime {
-        return Ok(binary.clone());
-    }
-    let resolved = runtime::resolve(ctx.runner, &ctx.config.spec.runtime.provider)?;
-    Ok(resolved.binary)
+    runtime::recorded_or_resolved(ctx.runner, &ctx.config.spec.runtime.provider, state.runtime.as_deref())
 }
 
 /// Mark the network as gone in state.
@@ -533,7 +536,7 @@ spec:
         let dir = test_dir();
         seed_state(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kind",
             CommandOutput {
@@ -562,7 +565,7 @@ spec:
         let dir = test_dir();
         seed_state(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kind",
             CommandOutput {
@@ -590,7 +593,7 @@ spec:
         let dir = test_dir();
         seed_state(dir.path());
         let config = test_config();
-        let runner = MockRunner::new();
+        let runner = MockRunner::with_runtime("docker");
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -676,7 +679,7 @@ spec:
         let dir = test_dir();
         seed_state_with_network(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
         respond_network_instance(&mut runner, 'a');
@@ -781,7 +784,7 @@ spec:
         let dir = test_dir();
         seed_state_with_services(dir.path(), &["db", "web"]);
         let config = test_config_with_services();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("docker", ok());
         respond_owned_container(&mut runner, "test-db");
         respond_owned_container(&mut runner, "test-web");
@@ -809,7 +812,7 @@ spec:
         // State tracks a service the config no longer lists.
         seed_state_with_services(dir.path(), &["edge"]);
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("docker", ok());
         respond_owned_container(&mut runner, "test-edge");
         let ctx = test_ctx(&runner, &config, &dir);
@@ -839,7 +842,7 @@ spec:
         let dir = test_dir();
         seed_state_with_services(dir.path(), &["edge"]);
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("docker", ok());
         runner.respond("docker container inspect test-edge", ok());
         runner.respond(
@@ -872,7 +875,7 @@ spec:
         let dir = test_dir();
         seed_state_with_network(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
         respond_network_instance(&mut runner, 'a');
@@ -910,7 +913,7 @@ spec:
         let dir = test_dir();
         seed_state_with_network(dir.path());
         let config = test_config();
-        let runner = MockRunner::new();
+        let runner = MockRunner::with_runtime("docker");
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -936,7 +939,7 @@ spec:
         let mut state = state::load(directory.path())?;
         state.network_created_by_forge = false;
         state::save(directory.path(), &state)?;
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
         respond_network_instance(&mut runner, 'a');
@@ -991,7 +994,7 @@ spec:
     fn down_preserves_replaced_network_instance() -> Result<(), ForgeError> {
         let directory = test_dir();
         seed_state_with_network(directory.path());
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
         respond_network_instance(&mut runner, 'b');
@@ -1017,7 +1020,7 @@ spec:
         let mut state = state::load(directory.path())?;
         state.network_id = None;
         state::save(directory.path(), &state)?;
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
         let _output = run_forced_network_teardown(&runner, directory.path())?;
@@ -1032,7 +1035,7 @@ spec:
     fn down_accepts_an_already_absent_owned_network() -> Result<(), ForgeError> {
         let directory = test_dir();
         seed_state_with_network(directory.path());
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", ok());
         runner.respond(
             "docker network inspect test-net",
@@ -1089,7 +1092,7 @@ spec:
 
     /// Supply successful immutable-ID cleanup and a selectable creation label.
     fn pending_creation_runner(token: &str) -> MockRunner {
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", ok());
         runner.respond("docker network inspect test-net", ok());
         respond_network_instance(&mut runner, 'a');

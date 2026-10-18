@@ -15,6 +15,7 @@ use crate::{
     context::ForgeContext,
     error::ForgeError,
     output::{self, OutputFormat},
+    runtime,
     state::{self, ClusterPhase, ClusterState, lock},
 };
 
@@ -55,7 +56,11 @@ fn handle_create(ctx: &ForgeContext<'_>, name: &str, writer: &mut dyn Write) -> 
     }
     let _lock = lock::acquire(&ctx.state_dir)?;
     let mut state = state::load(&ctx.state_dir)?;
-    let created = create_if_missing(ctx, &kind_name, cluster, &mut state, name)?;
+    let binary =
+        runtime::recorded_or_resolved(ctx.runner, &ctx.config.spec.runtime.provider, state.runtime.as_deref())?;
+    let provider = kind_ops::provider_for(ctx.runner, &binary)?;
+    state.runtime = Some(binary);
+    let created = create_if_missing(ctx, provider, &kind_name, cluster, &mut state)?;
     state::save(&ctx.state_dir, &state)?;
     if created {
         report_created(writer, name, &kind_name, &ctx.format)
@@ -99,15 +104,17 @@ fn handle_delete(
     }
     let _lock = lock::acquire(&ctx.state_dir)?;
     let mut st = state::load(&ctx.state_dir)?;
+    let provider = ctx.kind_provider(&st)?;
     set_phase_saved(ctx, &mut st, name, ClusterPhase::Deleting)?;
-    kind_ops::delete_cluster(ctx.runner, &kind_name)?;
+    kind_ops::delete_cluster(ctx.runner, provider, &kind_name)?;
     set_phase_saved(ctx, &mut st, name, ClusterPhase::Gone)?;
     report_deleted(writer, name, &kind_name, &ctx.format)
 }
 
 /// Handle `cluster list`.
 fn handle_list(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), ForgeError> {
-    let clusters = kind_ops::list_clusters(ctx.runner)?;
+    let provider = ctx.kind_provider(&state::load(&ctx.state_dir)?)?;
+    let clusters = kind_ops::list_clusters(ctx.runner, provider)?;
     render_list(writer, &clusters, &ctx.format)
 }
 
@@ -127,7 +134,8 @@ fn handle_kubeconfig(
         let msg = format!("would write kubeconfig for '{name}' to {}", path.display());
         return report_text_or_json(writer, &msg, &ctx.format);
     }
-    let kubeconfig = kind_ops::get_kubeconfig(ctx.runner, &kind_name)?;
+    let provider = ctx.kind_provider(&state::load(&ctx.state_dir)?)?;
+    let kubeconfig = kind_ops::get_kubeconfig(ctx.runner, provider, &kind_name)?;
     write_kubeconfig(writer, output_path, &kubeconfig, &ctx.format)
 }
 
@@ -142,7 +150,8 @@ fn handle_load_image(
     if ctx.dry_run {
         return report_dry_run(writer, "would load image into cluster", name, &kind_name, &ctx.format);
     }
-    kind_ops::load_image(ctx.runner, &kind_name, image)?;
+    let provider = ctx.kind_provider(&state::load(&ctx.state_dir)?)?;
+    kind_ops::load_image(ctx.runner, provider, &kind_name, image)?;
     report_image_loaded(writer, name, image, &ctx.format)
 }
 
@@ -202,12 +211,13 @@ fn cluster_kind_name(ctx: &ForgeContext<'_>, name: &str) -> String {
 /// processes.
 fn create_if_missing(
     ctx: &ForgeContext<'_>,
+    provider: kind_ops::KindProvider,
     kind_name: &str,
     cluster: &crate::config::ClusterSpec,
     st: &mut state::ForgeState,
-    name: &str,
 ) -> Result<bool, ForgeError> {
-    if kind_ops::cluster_exists(ctx.runner, kind_name)? {
+    let name = cluster.name.as_str();
+    if kind_ops::cluster_exists(ctx.runner, provider, kind_name)? {
         upsert_cluster_state(st, name, kind_name, ClusterPhase::Running);
         return Ok(false);
     }
@@ -217,9 +227,9 @@ fn create_if_missing(
         nodes: &cluster.nodes,
         ports: &cluster.ports,
         config_dir: &ctx.state_dir,
-        docker_network: None,
+        kind_network: None,
     };
-    kind_ops::create_cluster(ctx.runner, kind_name, &config)?;
+    kind_ops::create_cluster(ctx.runner, provider, kind_name, &config)?;
     upsert_cluster_state(st, name, kind_name, ClusterPhase::Running);
     Ok(true)
 }
@@ -420,6 +430,7 @@ mod tests {
     use super::*;
     use crate::command::runner::{CommandOutput, MockRunner};
 
+
     /// Build a minimal `ForgeConfig` with one cluster named `hub`.
     fn test_config() -> crate::config::ForgeConfig {
         let yaml = "\
@@ -492,7 +503,7 @@ spec:
     fn create_adopts_existing_cluster_into_state() {
         let dir = test_dir();
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind get clusters", stdout_ok("forge-hub\n"));
         let ctx = test_ctx(&runner, &config, &dir);
 
@@ -526,7 +537,7 @@ spec:
     fn create_persists_creating_phase_when_create_fails() {
         let dir = test_dir();
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind get clusters", stdout_ok(""));
         runner.respond(
             "kind",
@@ -560,7 +571,7 @@ spec:
         let dir = test_dir();
         seed_running_hub(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kind",
             CommandOutput {
@@ -595,7 +606,7 @@ spec:
     fn kubectl_failure_surfaces_stderr_and_errors() {
         let dir = test_dir();
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kubectl",
             CommandOutput {
@@ -630,7 +641,7 @@ spec:
     fn kubectl_success_json_uses_envelope() {
         let dir = test_dir();
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kubectl", stdout_ok("pod-a\n"));
         let mut ctx = test_ctx(&runner, &config, &dir);
         ctx.format = OutputFormat::Json;
@@ -665,7 +676,7 @@ spec:
 
         let dir = test_dir();
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind get kubeconfig --name forge-hub", stdout_ok("apiVersion: v1\n"));
         let ctx = test_ctx(&runner, &config, &dir);
         let out_path = dir.path().join("hub.kubeconfig");
@@ -776,7 +787,7 @@ spec:
     fn create_reports_created_for_new_cluster() {
         let dir = test_dir();
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind get clusters", stdout_ok(""));
         runner.respond("kind", stdout_ok(""));
         let ctx = test_ctx(&runner, &config, &dir);
@@ -828,7 +839,7 @@ spec:
     fn delete_forces_untracked_cluster_when_forced() {
         let dir = test_dir();
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", stdout_ok(""));
         let ctx = test_ctx(&runner, &config, &dir);
 
@@ -855,7 +866,7 @@ spec:
         let dir = test_dir();
         seed_running_hub(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind", stdout_ok(""));
         let ctx = test_ctx(&runner, &config, &dir);
 
@@ -880,6 +891,42 @@ spec:
             state::find_cluster(&st, "hub").map(|cs| cs.phase.clone()),
             Some(ClusterPhase::Gone),
             "a deleted tracked cluster must be recorded Gone"
+        );
+    }
+
+    #[test]
+    fn delete_uses_the_recorded_runtime() {
+        let dir = test_dir();
+        seed_running_hub(dir.path());
+        let mut st = state::load(dir.path()).unwrap_or_else(|_| std::process::abort());
+        st.runtime = Some("podman".to_owned());
+        state::save(dir.path(), &st).unwrap_or_else(|_| std::process::abort());
+        let mut config = test_config();
+        config.spec.runtime.provider = crate::config::RuntimeProvider::Auto;
+        let mut runner = MockRunner::with_runtime("docker");
+        runner.respond("kind", stdout_ok(""));
+        let ctx = test_ctx(&runner, &config, &dir);
+
+        run_dispatch(
+            &ctx,
+            &ClusterCommand::Delete {
+                name: "hub".to_owned(),
+                force: false,
+            },
+        );
+
+        let calls = runner.calls_matching("kind delete cluster");
+        let provider = calls
+            .first()
+            .and_then(|call| call.env.get(std::ffi::OsStr::new("KIND_EXPERIMENTAL_PROVIDER")));
+        assert_eq!(
+            provider.map(|val| val.to_string_lossy().into_owned()).as_deref(),
+            Some("podman"),
+            "kind delete should run on the recorded runtime"
+        );
+        assert!(
+            !runner.was_called("docker version"),
+            "a recorded runtime is not re-resolved"
         );
     }
 }

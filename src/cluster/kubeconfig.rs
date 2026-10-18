@@ -20,11 +20,12 @@ use crate::{cluster::kind, command::runner::CommandRunner, error::ForgeError};
 /// write fails.
 pub fn export_kubeconfig(
     runner: &dyn CommandRunner,
+    provider: kind::KindProvider,
     kind_name: &str,
     cluster_name: &str,
     state_dir: &Path,
 ) -> Result<(), ForgeError> {
-    let raw = kind::get_kubeconfig(runner, kind_name)?;
+    let raw = kind::get_kubeconfig(runner, provider, kind_name)?;
     if raw.trim().is_empty() {
         return Err(ForgeError::State(format!(
             "kind returned an empty kubeconfig for cluster '{kind_name}'"
@@ -181,7 +182,10 @@ fn tmp_sibling(path: &Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::runner::{CommandOutput, MockRunner};
+    use crate::{
+        cluster::kind::KindProvider,
+        command::runner::{CommandOutput, MockRunner},
+    };
 
     #[test]
     fn written_kubeconfig_is_owner_only() {
@@ -290,8 +294,14 @@ users:
                 stderr: String::new(),
             },
         );
-        export_kubeconfig(&runner, "grid-glb-edge-control", "edge-control", dir.path())
-            .unwrap_or_else(|_| std::process::abort());
+        export_kubeconfig(
+            &runner,
+            KindProvider::Docker,
+            "grid-glb-edge-control",
+            "edge-control",
+            dir.path(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert!(
             runner.was_called("kind get kubeconfig --name grid-glb-edge-control"),
             "should call kind get kubeconfig"
@@ -346,17 +356,17 @@ users:
                 stderr: String::new(),
             },
         );
-        export_kubeconfig(&runner, "grid-glb-edge-control", "edge-control", dir.path())
-            .unwrap_or_else(|_| std::process::abort());
+        export_kubeconfig(
+            &runner,
+            KindProvider::Docker,
+            "grid-glb-edge-control",
+            "edge-control",
+            dir.path(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let path = dir.path().join("runtime/kubeconfig/edge-control/config");
         assert!(path.exists(), "kubeconfig file should exist at {}", path.display());
-        let content = std::fs::read_to_string(&path).unwrap_or_else(|_| {
-            std::process::abort();
-            #[expect(unreachable_code, reason = "abort prevents reaching this")]
-            {
-                unreachable!()
-            }
-        });
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(
             content.contains("control-plane:6443"),
             "file should contain rewritten URL: {content}"
@@ -376,7 +386,7 @@ users:
             },
         );
 
-        let err = match export_kubeconfig(&runner, "test-hub", "hub", dir.path()) {
+        let err = match export_kubeconfig(&runner, KindProvider::Docker, "test-hub", "hub", dir.path()) {
             Ok(()) => std::process::abort(),
             Err(err) => err,
         };
@@ -399,7 +409,8 @@ users:
                 stderr: String::new(),
             },
         );
-        export_kubeconfig(&runner, "test-hub", "hub", dir.path()).unwrap_or_else(|_| std::process::abort());
+        export_kubeconfig(&runner, KindProvider::Docker, "test-hub", "hub", dir.path())
+            .unwrap_or_else(|_| std::process::abort());
         for call in runner.calls() {
             let display = format!("{call}");
             assert!(

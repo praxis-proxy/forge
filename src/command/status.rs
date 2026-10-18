@@ -43,7 +43,8 @@ fn probe_live(ctx: &ForgeContext<'_>, st: &state::ForgeState) -> Option<Vec<Stri
     if ctx.config.spec.clusters.is_empty() && st.clusters.is_empty() {
         return Some(Vec::new());
     }
-    kind_ops::list_clusters(ctx.runner).ok()
+    let provider = ctx.kind_provider(st).ok()?;
+    kind_ops::list_clusters(ctx.runner, provider).ok()
 }
 
 // ---------------------------------------------------------------
@@ -365,7 +366,7 @@ spec:
         let dir = test_dir();
         seed_running_hub(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kind get clusters",
             CommandOutput {
@@ -391,7 +392,7 @@ spec:
     fn status_reports_missing_cluster() {
         let dir = test_dir();
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kind get clusters",
             CommandOutput {
@@ -466,7 +467,7 @@ spec:
         let dir = test_dir();
         seed_running_hub(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kind get clusters",
             CommandOutput {
@@ -512,7 +513,7 @@ spec:
         // still delete it, so status must show it.
         seed_state_only_spoke(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kind get clusters",
             CommandOutput {
@@ -638,7 +639,7 @@ spec:
         let dir = test_dir();
         seed_with_service(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind get clusters", kind_hub_live());
         runner.respond("docker", docker_identity());
         let ctx = ForgeContext {
@@ -669,7 +670,7 @@ spec:
         let dir = test_dir();
         seed_with_service(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond("kind get clusters", kind_hub_live());
         runner.respond("docker", docker_gone());
         let ctx = ForgeContext {
@@ -703,7 +704,7 @@ spec:
         let dir = test_dir();
         seed_with_network(dir.path());
         let config = test_config();
-        let mut runner = MockRunner::new();
+        let mut runner = MockRunner::with_runtime("docker");
         runner.respond(
             "kind get clusters",
             CommandOutput {

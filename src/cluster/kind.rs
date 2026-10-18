@@ -12,6 +12,60 @@ use crate::{
     error::ForgeError,
 };
 
+/// Pins kind's node provider. Unset, kind prefers Docker whatever Forge resolved.
+const PROVIDER_ENV_KEY: &str = "KIND_EXPERIMENTAL_PROVIDER";
+
+/// The provider kind runs its nodes on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KindProvider {
+    /// Docker Engine.
+    Docker,
+    /// Podman, including behind the podman-docker shim.
+    Podman,
+}
+
+impl KindProvider {
+    /// Value for `KIND_EXPERIMENTAL_PROVIDER`.
+    const fn env_value(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+
+    /// The variable this provider reads to override the node network.
+    const fn network_env_key(self) -> &'static str {
+        match self {
+            Self::Docker => "KIND_EXPERIMENTAL_DOCKER_NETWORK",
+            Self::Podman => "KIND_EXPERIMENTAL_PODMAN_NETWORK",
+        }
+    }
+}
+
+/// The provider kind must use for a runtime binary.
+///
+/// Mirrors kind's own check: `docker` is Docker only when `docker -v` reports
+/// Docker, since the podman-docker shim answers with a podman version.
+///
+/// # Errors
+///
+/// Returns [`ForgeError`] if `docker -v` fails or the binary is unknown.
+pub fn provider_for(runner: &dyn CommandRunner, binary: &str) -> Result<KindProvider, ForgeError> {
+    match binary {
+        "podman" => Ok(KindProvider::Podman),
+        "docker" => {
+            let output = runner.run(&version_flag_spec(binary))?;
+            check_success(&output, "docker -v")?;
+            Ok(if output.stdout.starts_with("Docker version") {
+                KindProvider::Docker
+            } else {
+                KindProvider::Podman
+            })
+        },
+        other => Err(ForgeError::State(format!("unsupported container runtime {other:?}"))),
+    }
+}
+
 // ---------------------------------------------------------------
 // Naming
 // ---------------------------------------------------------------
@@ -35,8 +89,8 @@ pub fn kubectl_context(kind_name: &str) -> String {
 /// # Errors
 ///
 /// Returns [`ForgeError`] if the `kind get clusters` command fails.
-pub fn cluster_exists(runner: &dyn CommandRunner, kind_name: &str) -> Result<bool, ForgeError> {
-    let clusters = list_clusters(runner)?;
+pub fn cluster_exists(runner: &dyn CommandRunner, provider: KindProvider, kind_name: &str) -> Result<bool, ForgeError> {
+    let clusters = list_clusters(runner, provider)?;
     Ok(clusters.iter().any(|cl| cl == kind_name))
 }
 
@@ -48,26 +102,26 @@ pub struct CreateClusterConfig<'cfg> {
     pub ports: &'cfg [PortMapping],
     /// Directory where config files are written.
     pub config_dir: &'cfg std::path::Path,
-    /// Optional Docker network to join via `KIND_EXPERIMENTAL_DOCKER_NETWORK`.
-    pub docker_network: Option<&'cfg str>,
+    /// Optional container network for the nodes to join.
+    pub kind_network: Option<&'cfg str>,
 }
 
 /// Create a KIND cluster with a generated config.
 ///
-/// When `docker_network` is `Some`, the cluster nodes join that
-/// Docker network via `KIND_EXPERIMENTAL_DOCKER_NETWORK`.
+/// When `kind_network` is `Some`, the cluster nodes join that network.
 ///
 /// # Errors
 ///
 /// Returns [`ForgeError`] if the cluster cannot be created.
 pub fn create_cluster(
     runner: &dyn CommandRunner,
+    provider: KindProvider,
     kind_name: &str,
     config: &CreateClusterConfig<'_>,
 ) -> Result<(), ForgeError> {
     let config_yaml = generate_kind_config(config.nodes, config.ports);
     let config_path = write_kind_config(config.config_dir, kind_name, &config_yaml)?;
-    let result = run_create(runner, kind_name, &config_path, config.docker_network);
+    let result = run_create(runner, provider, kind_name, &config_path, config.kind_network);
     cleanup_kind_config(&config_path);
     result
 }
@@ -77,8 +131,8 @@ pub fn create_cluster(
 /// # Errors
 ///
 /// Returns [`ForgeError`] if the deletion command fails.
-pub fn delete_cluster(runner: &dyn CommandRunner, kind_name: &str) -> Result<(), ForgeError> {
-    let spec = delete_spec(kind_name);
+pub fn delete_cluster(runner: &dyn CommandRunner, provider: KindProvider, kind_name: &str) -> Result<(), ForgeError> {
+    let spec = delete_spec(provider, kind_name);
     let output = runner.run(&spec)?;
     check_success(&output, "kind delete cluster")
 }
@@ -88,8 +142,8 @@ pub fn delete_cluster(runner: &dyn CommandRunner, kind_name: &str) -> Result<(),
 /// # Errors
 ///
 /// Returns [`ForgeError`] if the `kind get clusters` command fails.
-pub fn list_clusters(runner: &dyn CommandRunner) -> Result<Vec<String>, ForgeError> {
-    let spec = list_spec();
+pub fn list_clusters(runner: &dyn CommandRunner, provider: KindProvider) -> Result<Vec<String>, ForgeError> {
+    let spec = list_spec(provider);
     let output = runner.run(&spec)?;
     // Without this, a failed `kind get clusters` parses as an empty list, which
     // reads as "no clusters exist" and lets callers create over a live cluster.
@@ -102,8 +156,12 @@ pub fn list_clusters(runner: &dyn CommandRunner) -> Result<Vec<String>, ForgeErr
 /// # Errors
 ///
 /// Returns [`ForgeError`] if the command fails.
-pub fn get_kubeconfig(runner: &dyn CommandRunner, kind_name: &str) -> Result<String, ForgeError> {
-    let spec = kubeconfig_spec(kind_name);
+pub fn get_kubeconfig(
+    runner: &dyn CommandRunner,
+    provider: KindProvider,
+    kind_name: &str,
+) -> Result<String, ForgeError> {
+    let spec = kubeconfig_spec(provider, kind_name);
     let output = runner.run(&spec)?;
     check_success(&output, "kind get kubeconfig")?;
     Ok(output.stdout)
@@ -114,8 +172,13 @@ pub fn get_kubeconfig(runner: &dyn CommandRunner, kind_name: &str) -> Result<Str
 /// # Errors
 ///
 /// Returns [`ForgeError`] if the command fails.
-pub fn load_image(runner: &dyn CommandRunner, kind_name: &str, image: &str) -> Result<(), ForgeError> {
-    let spec = load_image_spec(kind_name, image);
+pub fn load_image(
+    runner: &dyn CommandRunner,
+    provider: KindProvider,
+    kind_name: &str,
+    image: &str,
+) -> Result<(), ForgeError> {
+    let spec = load_image_spec(provider, kind_name, image);
     let output = runner.run(&spec)?;
     check_success(&output, "kind load docker-image")
 }
@@ -187,11 +250,12 @@ fn write_kind_config(dir: &std::path::Path, kind_name: &str, content: &str) -> R
 /// Run `kind create cluster` with the given config file.
 fn run_create(
     runner: &dyn CommandRunner,
+    provider: KindProvider,
     kind_name: &str,
     config_path: &std::path::Path,
-    docker_network: Option<&str>,
+    kind_network: Option<&str>,
 ) -> Result<(), ForgeError> {
-    let spec = create_spec(kind_name, config_path, docker_network);
+    let spec = create_spec(provider, kind_name, config_path, kind_network);
     let output = runner.run(&spec)?;
     check_success(&output, "kind create cluster")
 }
@@ -201,11 +265,32 @@ fn cleanup_kind_config(path: &std::path::Path) {
     let _ignored = std::fs::remove_file(path);
 }
 
+/// Environment that pins kind to Forge's runtime.
+fn provider_env(provider: KindProvider) -> BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    BTreeMap::from([(PROVIDER_ENV_KEY.into(), provider.env_value().into())])
+}
+
+/// Build a `<binary> -v` command spec, the check kind uses to detect Docker.
+fn version_flag_spec(binary: &str) -> CommandSpec {
+    CommandSpec {
+        program: binary.into(),
+        args: vec!["-v".into()],
+        env: BTreeMap::default(),
+        stdin: None,
+        redact: Vec::new(),
+    }
+}
+
 /// Build a `kind create cluster` command spec.
-fn create_spec(kind_name: &str, config_path: &std::path::Path, docker_network: Option<&str>) -> CommandSpec {
-    let mut env = BTreeMap::default();
-    if let Some(net) = docker_network {
-        env.insert("KIND_EXPERIMENTAL_DOCKER_NETWORK".into(), net.into());
+fn create_spec(
+    provider: KindProvider,
+    kind_name: &str,
+    config_path: &std::path::Path,
+    kind_network: Option<&str>,
+) -> CommandSpec {
+    let mut env = provider_env(provider);
+    if let Some(net) = kind_network {
+        env.insert(provider.network_env_key().into(), net.into());
     }
     CommandSpec {
         program: "kind".into(),
@@ -224,40 +309,40 @@ fn create_spec(kind_name: &str, config_path: &std::path::Path, docker_network: O
 }
 
 /// Build a `kind delete cluster` command spec.
-fn delete_spec(kind_name: &str) -> CommandSpec {
+fn delete_spec(provider: KindProvider, kind_name: &str) -> CommandSpec {
     CommandSpec {
         program: "kind".into(),
         args: vec!["delete".into(), "cluster".into(), "--name".into(), kind_name.into()],
-        env: BTreeMap::default(),
+        env: provider_env(provider),
         stdin: None,
         redact: Vec::new(),
     }
 }
 
 /// Build a `kind get clusters` command spec.
-fn list_spec() -> CommandSpec {
+fn list_spec(provider: KindProvider) -> CommandSpec {
     CommandSpec {
         program: "kind".into(),
         args: vec!["get".into(), "clusters".into()],
-        env: BTreeMap::default(),
+        env: provider_env(provider),
         stdin: None,
         redact: Vec::new(),
     }
 }
 
 /// Build a `kind get kubeconfig` command spec.
-fn kubeconfig_spec(kind_name: &str) -> CommandSpec {
+fn kubeconfig_spec(provider: KindProvider, kind_name: &str) -> CommandSpec {
     CommandSpec {
         program: "kind".into(),
         args: vec!["get".into(), "kubeconfig".into(), "--name".into(), kind_name.into()],
-        env: BTreeMap::default(),
+        env: provider_env(provider),
         stdin: None,
         redact: Vec::new(),
     }
 }
 
 /// Build a `kind load docker-image` command spec.
-fn load_image_spec(kind_name: &str, image: &str) -> CommandSpec {
+fn load_image_spec(provider: KindProvider, kind_name: &str, image: &str) -> CommandSpec {
     CommandSpec {
         program: "kind".into(),
         args: vec![
@@ -267,7 +352,7 @@ fn load_image_spec(kind_name: &str, image: &str) -> CommandSpec {
             "--name".into(),
             kind_name.into(),
         ],
-        env: BTreeMap::default(),
+        env: provider_env(provider),
         stdin: None,
         redact: Vec::new(),
     }
@@ -427,17 +512,87 @@ mod tests {
     }
 
     #[test]
-    fn create_spec_sets_docker_network_env() {
-        let spec = create_spec("forge-hub", std::path::Path::new("/tmp/cfg.yaml"), Some("test-net"));
-        let key = std::ffi::OsString::from("KIND_EXPERIMENTAL_DOCKER_NETWORK");
-        let expected = std::ffi::OsString::from("test-net");
-        assert_eq!(spec.env.get(&key), Some(&expected), "should set network env");
+    fn create_spec_pins_the_provider_and_its_network() {
+        for provider in [KindProvider::Docker, KindProvider::Podman] {
+            let spec = create_spec(
+                provider,
+                "forge-hub",
+                std::path::Path::new("/tmp/cfg.yaml"),
+                Some("test-net"),
+            );
+            let expected = BTreeMap::from([
+                (
+                    std::ffi::OsString::from(PROVIDER_ENV_KEY),
+                    std::ffi::OsString::from(provider.env_value()),
+                ),
+                (
+                    std::ffi::OsString::from(provider.network_env_key()),
+                    std::ffi::OsString::from("test-net"),
+                ),
+            ]);
+            assert_eq!(spec.env, expected, "{provider:?}: provider plus its own network only");
+        }
     }
 
     #[test]
-    fn create_spec_omits_env_without_network() {
-        let spec = create_spec("forge-hub", std::path::Path::new("/tmp/cfg.yaml"), None);
-        assert!(spec.env.is_empty(), "should have no env vars without network");
+    fn create_spec_pins_the_provider_without_network() {
+        let spec = create_spec(
+            KindProvider::Podman,
+            "forge-hub",
+            std::path::Path::new("/tmp/cfg.yaml"),
+            None,
+        );
+        assert_eq!(
+            spec.env,
+            provider_env(KindProvider::Podman),
+            "provider only without network"
+        );
+    }
+
+    #[test]
+    fn every_lifecycle_spec_pins_the_provider() {
+        let provider = KindProvider::Podman;
+        let expected = provider_env(provider);
+        for spec in [
+            list_spec(provider),
+            delete_spec(provider, "forge-hub"),
+            kubeconfig_spec(provider, "forge-hub"),
+            load_image_spec(provider, "forge-hub", "img:1"),
+        ] {
+            assert_eq!(spec.env, expected, "{spec} should pin the provider");
+        }
+    }
+
+    #[test]
+    fn docker_shim_resolves_to_podman() {
+        for (stdout, want) in [
+            ("Docker version 27.3.1, build ce12230\n", KindProvider::Docker),
+            ("podman version 5.6.1\n", KindProvider::Podman),
+        ] {
+            let mut runner = MockRunner::new();
+            runner.respond(
+                "docker -v",
+                CommandOutput {
+                    status: 0,
+                    stdout: stdout.to_owned(),
+                    stderr: String::new(),
+                },
+            );
+            let got = provider_for(&runner, "docker").unwrap_or_else(|_| std::process::abort());
+            assert_eq!(got, want, "docker -v: {stdout}");
+        }
+    }
+
+    #[test]
+    fn podman_needs_no_probe_and_unknown_runtimes_fail() {
+        let runner = MockRunner::new();
+        assert_eq!(
+            provider_for(&runner, "podman").ok(),
+            Some(KindProvider::Podman),
+            "podman is podman"
+        );
+        assert!(provider_for(&runner, "nerdctl").is_err(), "unknown runtime is refused");
+        assert_eq!(runner.call_count(), 0, "neither case runs a command");
     }
 
     #[test]
@@ -451,7 +606,7 @@ mod tests {
                 stderr: String::new(),
             },
         );
-        let exists = cluster_exists(&runner, "forge-hub").unwrap_or_else(|_| {
+        let exists = cluster_exists(&runner, KindProvider::Docker, "forge-hub").unwrap_or_else(|_| {
             std::process::abort();
             #[expect(unreachable_code, reason = "abort prevents reaching this")]
             {
@@ -472,7 +627,7 @@ mod tests {
                 stderr: String::new(),
             },
         );
-        let exists = cluster_exists(&runner, "forge-missing").unwrap_or_else(|_| {
+        let exists = cluster_exists(&runner, KindProvider::Docker, "forge-missing").unwrap_or_else(|_| {
             std::process::abort();
             #[expect(unreachable_code, reason = "abort prevents reaching this")]
             {

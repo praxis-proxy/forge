@@ -34,6 +34,33 @@ pub fn resolve(runner: &dyn CommandRunner, requested: &RuntimeProvider) -> Resul
     }
 }
 
+/// The runtime binary an environment uses: the one recorded in state, else a fresh resolve.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Runtime`] if nothing is recorded and resolution fails, or
+/// if the config names a runtime other than the recorded one.
+pub fn recorded_or_resolved(
+    runner: &dyn CommandRunner,
+    requested: &RuntimeProvider,
+    recorded: Option<&str>,
+) -> Result<String, ForgeError> {
+    let Some(binary) = recorded else {
+        return resolve(runner, requested).map(|rt| rt.binary);
+    };
+    let wanted = match requested {
+        RuntimeProvider::Auto => None,
+        RuntimeProvider::Docker => Some("docker"),
+        RuntimeProvider::Podman => Some("podman"),
+    };
+    match wanted {
+        Some(want) if want != binary => Err(ForgeError::Runtime(format!(
+            "config requests {want} but this environment runs on {binary}; run `forge down` first"
+        ))),
+        _ => Ok(binary.to_owned()),
+    }
+}
+
 /// Outcome of probing one runtime binary with `<program> version`.
 #[derive(Debug)]
 enum ProbeOutcome {
@@ -285,5 +312,17 @@ mod tests {
             }
         });
         assert_eq!(rt.binary, "podman", "binary should be podman");
+    }
+
+    #[test]
+    fn recorded_runtime_wins_and_a_conflicting_config_is_refused() {
+        let runner = MockRunner::new();
+        let auto = recorded_or_resolved(&runner, &RuntimeProvider::Auto, Some("podman"));
+        assert_eq!(auto.ok().as_deref(), Some("podman"), "auto keeps the recorded runtime");
+        let same = recorded_or_resolved(&runner, &RuntimeProvider::Podman, Some("podman"));
+        assert_eq!(same.ok().as_deref(), Some("podman"), "a matching config keeps it");
+        let conflict = recorded_or_resolved(&runner, &RuntimeProvider::Docker, Some("podman"));
+        assert!(conflict.is_err(), "a conflicting config is refused");
+        assert_eq!(runner.call_count(), 0, "a recorded runtime runs no probe");
     }
 }

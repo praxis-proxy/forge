@@ -26,22 +26,30 @@ use crate::{
 /// Returns [`ForgeError`] if runtime detection, cluster creation,
 /// or state persistence fails.
 pub fn run(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), ForgeError> {
-    let resolved = runtime::resolve(ctx.runner, &ctx.config.spec.runtime.provider)?;
-    if wants_network(ctx) {
-        networking::require_docker_for_cross_cluster(&resolved.binary)?;
-    }
     let _lock = lock::acquire(&ctx.state_dir)?;
     let mut state = state::load(&ctx.state_dir)?;
-    state.runtime = Some(resolved.binary.clone());
-    let binary = resolved.binary.as_str();
+    let binary = runtime_for(ctx, &state)?;
+    let provider = kind_ops::provider_for(ctx.runner, &binary)?;
+    state.runtime = Some(binary.clone());
+    let binary = binary.as_str();
     let net_result = checkpointed(ctx, &mut state, "up", |st| ensure_network(ctx, binary, st))?;
-    let results = checkpointed(ctx, &mut state, "up", |st| create_clusters(ctx, st))?;
-    export_kubeconfigs(ctx, &state)?;
+    let results = checkpointed(ctx, &mut state, "up", |st| create_clusters(ctx, provider, st))?;
+    export_kubeconfigs(ctx, provider, &state)?;
     let svc_results = checkpointed(ctx, &mut state, "up", |st| start_services(ctx, binary, st))?;
     update_digest(ctx, &mut state)?;
     record_operation(&mut state, "up", true);
     checkpoint(ctx, &state)?;
     render_all(writer, net_result.as_ref(), &results, &svc_results, &ctx.format)
+}
+
+/// The runtime for this run: the recorded one while anything it created is
+/// live, so a newly responding runtime cannot orphan it, else a fresh resolve.
+fn runtime_for(ctx: &ForgeContext<'_>, st: &state::ForgeState) -> Result<String, ForgeError> {
+    let live = st.network_created_by_forge
+        || st.clusters.iter().any(|cluster| cluster.phase != ClusterPhase::Gone)
+        || st.services.iter().any(|svc| svc.phase != ServicePhase::Gone);
+    let recorded = if live { st.runtime.as_deref() } else { None };
+    runtime::recorded_or_resolved(ctx.runner, &ctx.config.spec.runtime.provider, recorded)
 }
 
 // ---------------------------------------------------------------
@@ -211,18 +219,34 @@ struct ClusterResult {
 }
 
 /// Iterate configured clusters, creating any that are missing.
-fn create_clusters(ctx: &ForgeContext<'_>, state: &mut state::ForgeState) -> Result<Vec<ClusterResult>, ForgeError> {
-    let docker_network = docker_network_for_kind(ctx);
+fn create_clusters(
+    ctx: &ForgeContext<'_>,
+    provider: kind_ops::KindProvider,
+    state: &mut state::ForgeState,
+) -> Result<Vec<ClusterResult>, ForgeError> {
+    let network = kind_network_for_clusters(ctx);
+    let target = KindTarget {
+        provider,
+        network: network.as_deref(),
+    };
     let mut results = Vec::new();
     for cluster in &ctx.config.spec.clusters {
-        let result = process_cluster(ctx, state, cluster, docker_network.as_deref())?;
+        let result = process_cluster(ctx, state, cluster, &target)?;
         results.push(result);
     }
     Ok(results)
 }
 
-/// Determine the Docker network name for KIND clusters, if any.
-fn docker_network_for_kind(ctx: &ForgeContext<'_>) -> Option<String> {
+/// The runtime kind runs on and the network its nodes join.
+struct KindTarget<'run> {
+    /// Provider kind must use, matching Forge's runtime.
+    provider: kind_ops::KindProvider,
+    /// Container network for the nodes, if any.
+    network: Option<&'run str>,
+}
+
+/// Determine the container network name for KIND clusters, if any.
+fn kind_network_for_clusters(ctx: &ForgeContext<'_>) -> Option<String> {
     ctx.config
         .spec
         .network
@@ -236,13 +260,13 @@ fn process_cluster(
     ctx: &ForgeContext<'_>,
     state: &mut state::ForgeState,
     cluster: &ClusterSpec,
-    docker_network: Option<&str>,
+    target: &KindTarget<'_>,
 ) -> Result<ClusterResult, ForgeError> {
     let kind_name = kind_ops::kind_cluster_name(&ctx.config.spec.runtime.cluster_prefix, &cluster.name);
     if ctx.dry_run {
         return Ok(dry_run_result(&cluster.name, &kind_name));
     }
-    let created = create_if_missing(ctx, &kind_name, cluster, state, docker_network)?;
+    let created = create_if_missing(ctx, &kind_name, cluster, state, target)?;
     Ok(ClusterResult {
         name: cluster.name.clone(),
         kind_name,
@@ -271,9 +295,9 @@ fn create_if_missing(
     kind_name: &str,
     cluster: &ClusterSpec,
     state: &mut state::ForgeState,
-    docker_network: Option<&str>,
+    target: &KindTarget<'_>,
 ) -> Result<bool, ForgeError> {
-    if kind_ops::cluster_exists(ctx.runner, kind_name)? {
+    if kind_ops::cluster_exists(ctx.runner, target.provider, kind_name)? {
         ensure_state_entry(state, &cluster.name, kind_name, ClusterPhase::Running);
         return Ok(false);
     }
@@ -283,9 +307,9 @@ fn create_if_missing(
         nodes: &cluster.nodes,
         ports: &cluster.ports,
         config_dir: &ctx.state_dir,
-        docker_network,
+        kind_network: target.network,
     };
-    kind_ops::create_cluster(ctx.runner, kind_name, &cluster_config)?;
+    kind_ops::create_cluster(ctx.runner, target.provider, kind_name, &cluster_config)?;
     ensure_state_entry(state, &cluster.name, kind_name, ClusterPhase::Running);
     Ok(true)
 }
@@ -322,7 +346,11 @@ fn ensure_state_entry(state: &mut state::ForgeState, name: &str, kind_name: &str
 /// Skipped during dry-run. On a real run, exports a kubeconfig for
 /// each cluster in state so services on the Docker network can
 /// reach cluster API servers by DNS name.
-fn export_kubeconfigs(ctx: &ForgeContext<'_>, state: &state::ForgeState) -> Result<(), ForgeError> {
+fn export_kubeconfigs(
+    ctx: &ForgeContext<'_>,
+    provider: kind_ops::KindProvider,
+    state: &state::ForgeState,
+) -> Result<(), ForgeError> {
     if ctx.dry_run || ctx.config.spec.services.is_empty() {
         return Ok(());
     }
@@ -330,7 +358,7 @@ fn export_kubeconfigs(ctx: &ForgeContext<'_>, state: &state::ForgeState) -> Resu
         if cluster.phase != ClusterPhase::Running {
             continue;
         }
-        kubeconfig::export_kubeconfig(ctx.runner, &cluster.kind_name, &cluster.name, &ctx.state_dir)?;
+        kubeconfig::export_kubeconfig(ctx.runner, provider, &cluster.kind_name, &cluster.name, &ctx.state_dir)?;
     }
     Ok(())
 }
@@ -663,6 +691,21 @@ spec:
         })
     }
 
+    /// Build a successful response with the given stdout.
+    fn stdout_ok(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    /// Answer the runtime probe and kind's `docker -v` check as real Docker.
+    fn respond_docker(runner: &mut MockRunner) {
+        runner.respond("docker version", docker_ok());
+        runner.respond("docker -v", stdout_ok("Docker version 27.3.1, build ce12230\n"));
+    }
+
     /// Build a successful docker-version mock response.
     fn docker_ok() -> CommandOutput {
         CommandOutput {
@@ -739,7 +782,7 @@ users:
     /// Build a mock that responds to docker, kind list, kind create.
     fn mock_for_create() -> MockRunner {
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("kind get clusters", empty_ok());
         runner.respond("kind", empty_ok());
         runner
@@ -775,7 +818,7 @@ users:
         let dir = test_dir();
         let config = test_config();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond(
             "kind get clusters",
             CommandOutput {
@@ -803,7 +846,7 @@ users:
         let dir = test_dir();
         let config = test_config();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("kind get clusters", empty_ok());
         // The generic kind responder covers `kind create cluster`.
         runner.respond(
@@ -840,7 +883,7 @@ users:
         let dir = test_dir();
         let config = test_config();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -914,7 +957,7 @@ spec:
         let config = test_config_with_disabled_service();
         let dir = test_dir();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -1017,7 +1060,7 @@ spec:
         // Nothing listens on the probed port, so every retry fails.
         let config = test_config_with_health_check(closed_port());
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("docker container inspect test-web", docker_not_found());
         runner.respond("docker", empty_ok());
         let ctx = ForgeContext {
@@ -1051,7 +1094,7 @@ spec:
     /// Mock a successful `forge up` for an environment with services.
     fn mock_for_service_kubeconfig_export() -> MockRunner {
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("kind get clusters", empty_ok());
         runner.respond("kind", empty_ok());
         runner.respond(
@@ -1243,7 +1286,7 @@ spec:
         let dir = test_dir();
         let config = test_config_with_network();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("docker network inspect test-net", net_not_found());
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
@@ -1266,7 +1309,64 @@ spec:
             text.contains("network 'test-net' ready"),
             "should report network: {text}"
         );
-        assert_kind_create_has_network_env(&runner, "test-net");
+        assert_kind_create_has_network_env(&runner, "docker", "test-net");
+    }
+
+    #[test]
+    fn up_pins_kind_to_podman_behind_the_docker_shim() {
+        let dir = test_dir();
+        let config = test_config_with_network();
+        let mut runner = MockRunner::new();
+        runner.respond("docker version", docker_ok());
+        runner.respond("docker -v", stdout_ok("podman version 5.6.1\n"));
+        runner.respond("docker network inspect test-net", net_not_found());
+        runner.respond(
+            "docker network inspect test-net --format {{json .}}",
+            network_cidr("10.89.0.0/24"),
+        );
+        respond_created_network(&mut runner);
+        runner.respond("kind get clusters", empty_ok());
+        runner.respond("kind", empty_ok());
+        let ctx = ForgeContext {
+            runner: &runner,
+            config: &config,
+            state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+            format: OutputFormat::Text,
+            dry_run: false,
+        };
+        let _text = run_up(&ctx);
+        assert_kind_create_has_network_env(&runner, "podman", "test-net");
+    }
+
+    #[test]
+    fn up_keeps_the_recorded_runtime_while_clusters_are_live() {
+        let dir = test_dir();
+        let mut st = state::empty();
+        st.runtime = Some("podman".to_owned());
+        st.clusters.push(ClusterState {
+            name: "hub".to_owned(),
+            kind_name: "forge-hub".to_owned(),
+            context: "kind-forge-hub".to_owned(),
+            phase: ClusterPhase::Running,
+        });
+        state::save(dir.path(), &st).unwrap_or_else(|_| std::process::abort());
+        let mut config = test_config();
+        config.spec.runtime.provider = crate::config::RuntimeProvider::Auto;
+        let mut runner = MockRunner::with_runtime("docker");
+        runner.respond("kind get clusters", stdout_ok("forge-hub\n"));
+        let ctx = ForgeContext {
+            runner: &runner,
+            config: &config,
+            state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+            format: OutputFormat::Text,
+            dry_run: false,
+        };
+        let _text = run_up(&ctx);
+        let saved = state::load(dir.path()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(saved.runtime.as_deref(), Some("podman"), "keeps its runtime");
+        assert!(!runner.was_called("docker version"), "no fresh resolve");
     }
 
     /// A failing `kind get clusters` probe.
@@ -1284,7 +1384,7 @@ spec:
         let dir = test_dir();
         let config = test_config_with_network();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("docker network inspect test-net", net_not_found());
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
@@ -1338,7 +1438,7 @@ spec:
         let dir = test_dir();
         let config = test_config_with_network();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("docker network inspect test-net", net_not_found());
         // The network is created, then the CIDR inspect fails. The network is
         // live either way, so it has to be recorded for `down` to remove it.
@@ -1417,7 +1517,7 @@ spec:
         let dir = test_dir();
         let config = test_config_with_network();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -1458,7 +1558,7 @@ spec:
         let dir = test_dir();
         let config = test_config_with_network();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -1523,7 +1623,7 @@ spec:
         let config = test_config_cross_auto();
         let dir = test_dir();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("docker network inspect test-net", net_not_found());
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
@@ -1548,12 +1648,20 @@ spec:
     }
 
     #[test]
-    fn cross_cluster_auto_resolved_podman_fails() {
+    fn cross_cluster_auto_resolved_podman_passes() {
         let config = test_config_cross_auto();
         let dir = test_dir();
         let mut runner = MockRunner::new();
         runner.respond("docker version", docker_not_found());
         runner.respond("podman version", podman_ok());
+        runner.respond("podman network inspect test-net", net_not_found());
+        runner.respond(
+            "podman network inspect test-net --format {{json .}}",
+            network_cidr("10.89.0.0/24"),
+        );
+        runner.respond("podman", created_network());
+        runner.respond("kind get clusters", empty_ok());
+        runner.respond("kind", empty_ok());
         let ctx = ForgeContext {
             runner: &runner,
             config: &config,
@@ -1562,14 +1670,12 @@ spec:
             format: OutputFormat::Text,
             dry_run: false,
         };
-        let mut buf = Vec::new();
-        let result = run(&ctx, &mut buf);
-        assert!(result.is_err(), "auto+podman+crossCluster should fail");
-        let Err(err) = result else {
-            std::process::abort();
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Docker"), "error should mention Docker: {msg}");
+        let text = run_up(&ctx);
+        assert!(
+            text.contains("network 'test-net' ready"),
+            "auto+podman should succeed: {text}"
+        );
+        assert_kind_create_has_network_env(&runner, "podman", "test-net");
     }
 
     #[test]
@@ -1577,7 +1683,7 @@ spec:
         let dir = test_dir();
         let config = test_config_with_network();
         let mut runner = MockRunner::new();
-        runner.respond("docker version", docker_ok());
+        respond_docker(&mut runner);
         runner.respond("docker network inspect test-net", net_not_found());
         runner.respond(
             "docker network inspect test-net --format {{json .}}",
@@ -1626,15 +1732,26 @@ spec:
 
     // Test Utilities
 
-    /// Verify `kind create` was called with the expected Docker network env.
-    fn assert_kind_create_has_network_env(runner: &MockRunner, expected: &str) {
+    /// Verify `kind create` was called with the expected network env.
+    fn assert_kind_create_has_network_env(runner: &MockRunner, provider: &str, expected: &str) {
         let calls = runner.calls();
         let Some(call) = calls.iter().find(|cl| cl.to_string().contains("kind create")) else {
             std::process::abort();
         };
-        let key = std::ffi::OsString::from("KIND_EXPERIMENTAL_DOCKER_NETWORK");
-        let val = call.env.get(&key).map(|os| os.to_string_lossy().into_owned());
-        assert_eq!(val.as_deref(), Some(expected), "kind create should set network env");
+        let network_key = if provider == "podman" {
+            "KIND_EXPERIMENTAL_PODMAN_NETWORK"
+        } else {
+            "KIND_EXPERIMENTAL_DOCKER_NETWORK"
+        };
+        let want: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            std::collections::BTreeMap::from([
+                ("KIND_EXPERIMENTAL_PROVIDER".into(), provider.into()),
+                (network_key.into(), expected.into()),
+            ]);
+        assert_eq!(
+            call.env, want,
+            "kind create should pin {provider} and set only its network"
+        );
     }
 
     /// Config with `crossCluster: true` and `provider: auto`.
