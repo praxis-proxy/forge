@@ -1,4 +1,6 @@
 # Praxis Forge
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fforge.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fforge?ref=badge_shield)
+
 
 Development environment orchestration tool for Praxis development and testing.
 
@@ -244,3 +246,6 @@ external command execution without running real processes.
 ## License
 
 Apache License 2.0
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fforge.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fforge?ref=badge_large)
